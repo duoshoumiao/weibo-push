@@ -10,3 +10,5 @@
 查看关注的微博：查看本群已关注的微博账号 
 
 微博推送开关 [on/off]：开启或关闭本群微博推送（管理员） 
+
+<img width="440" height="713" alt="image" src="https://github.com/user-attachments/assets/7fd5f877-60aa-4e28-8f3f-9731e9177508" />
