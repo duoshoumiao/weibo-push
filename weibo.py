@@ -28,7 +28,7 @@ weibo_config = {
 
 
 def format_weibo_time(raw_time):
-    """将微博原始时间格式（如Mon Aug 11 16:50:55 +0800 2025）转换为YYYY-MM-DD HH:MM:SS格式"""
+    """将微博原始时间格式转换为YYYY-MM-DD HH:MM:SS格式"""
     try:
         dt = datetime.strptime(raw_time, '%a %b %d %H:%M:%S %z %Y')
         return dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -86,7 +86,7 @@ async def get_weibo_user_info(uid):
         sv.logger.error(f"获取微博用户信息失败: {e}")
         return {'name': f'用户{uid}', 'uid': uid}
 
-# 获取微博用户最新微博
+# 获取微博用户最新微博（包含视频封面提取）
 async def get_weibo_user_latest_posts(uid, count=5):
     url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1'
     try:
@@ -108,20 +108,44 @@ async def get_weibo_user_latest_posts(uid, count=5):
                         text = re.sub(r'<br\s*/?>', '\n', raw_text)  
                         text = re.sub(r'<[^>]+>', '', text) 
                         text = html.unescape(text) 
-                        text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9.,!?#@_ \n]', '', text) 
                         text = text.strip() or "【无正文内容】"  
                         
                         # 处理图片
                         pics = mblog.get('pics', [])
                         pic_urls = [pic.get('large', {}).get('url', '') for pic in pics if pic.get('large')]
                         
-                        # 新增：应用时间格式化
+                        # 处理视频（包含封面）
+                        video_info = {
+                            'urls': [],
+                            'cover_url': ''  # 新增视频封面字段
+                        }
+                        page_info = mblog.get('page_info', {})
+                        if page_info.get('type') == 'video':
+                            # 获取视频播放页链接
+                            video_url = f"https://video.weibo.com/show?fid={page_info.get('fid', '')}"
+                            video_info['urls'].append(video_url)
+                            
+                            # 提取视频封面
+                            video_info['cover_url'] = page_info.get('page_pic', {}).get('url', '')
+                            if not video_info['cover_url']:
+                                # 备选方案：从其他字段获取封面
+                                video_info['cover_url'] = page_info.get('media_info', {}).get('stream_url_hd', '').replace('mp4', 'jpg')
+                            
+                            # 尝试获取视频直接下载链接
+                            if 'playback_list' in page_info:
+                                for pl in page_info['playback_list']:
+                                    if pl.get('url'):
+                                        video_info['urls'].append(pl['url'])
+                                        break
+                        
+                        # 应用时间格式化
                         formatted_time = format_weibo_time(mblog.get('created_at', '未知时间'))
                         
                         posts.append({
                             'id': mblog.get('id', ''),
                             'text': text,
                             'pics': pic_urls,
+                            'video': video_info,  # 视频信息（包含封面和链接）
                             'created_at': formatted_time, 
                             'reposts_count': mblog.get('reposts_count', 0),
                             'comments_count': mblog.get('comments_count', 0),
@@ -172,7 +196,7 @@ async def check_and_push_new_weibo():
     
     sv.logger.info("微博更新检查完成")
 
-# 推送微博到指定群列表（图片放在文本正下方，修复格式问题）
+# 推送微博到指定群列表（包含视频封面显示）
 async def push_weibo_to_groups(group_ids, name, post):
     msg_parts = []
     
@@ -180,18 +204,34 @@ async def push_weibo_to_groups(group_ids, name, post):
     
     msg_parts.append(f"{post['text']}\n\n")
     
+    # 处理图片
     for i, pic_url in enumerate(post['pics']):
         if pic_url:
-             
             escaped_url = escape(pic_url)
-             
-            if i == len(post['pics']) - 1:
+            # 如果是最后一张图且没有视频，不加换行
+            if i == len(post['pics']) - 1 and not post['video']['urls']:
                 msg_parts.append(f"[CQ:image,url={escaped_url}]")
             else:
                 msg_parts.append(f"[CQ:image,url={escaped_url}]\n")
     
-    # 4. 统计信息与链接（仅在有内容时添加）
-    if post['text'] or post['pics']:
+    # 处理视频（先显示封面，再显示链接）
+    if post['video']['urls']:
+        # 显示视频封面
+        if post['video']['cover_url']:
+            escaped_cover_url = escape(post['video']['cover_url'])
+            msg_parts.append(f"[CQ:image,url={escaped_cover_url}]\n")
+        
+        # 显示视频链接
+        msg_parts.append("🎬 视频链接：\n")
+        for i, video_url in enumerate(post['video']['urls']):
+            if video_url.startswith('http'):
+                if i == 0:
+                    msg_parts.append(f"[播放页] {video_url}\n")
+                else:
+                    msg_parts.append(f"[下载链接] {video_url}\n")
+    
+    # 统计信息与链接
+    if post['text'] or post['pics'] or post['video']['urls']:
         msg_parts.append(f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}")
         msg_parts.append(f"\n发布时间：{post['created_at']}") 
         msg_parts.append(f"\n原文链接：https://m.weibo.cn/status/{post['id']}")
@@ -199,8 +239,8 @@ async def push_weibo_to_groups(group_ids, name, post):
     # 合并为完整消息
     full_message = ''.join(msg_parts)
     
-    # 调试日志（便于排查问题）
-    sv.logger.debug(f"推送消息内容: {full_message[:200]}...")  # 只显示前200字符
+    # 调试日志
+    sv.logger.debug(f"推送消息内容: {full_message[:200]}...")
     
     # 发送到目标群
     for group_id in group_ids:
@@ -253,6 +293,60 @@ async def follow_weibo(bot, ev: CQEvent):
     _nlmt.increase(user_id)
     flmt.start_cd(user_id)
     await bot.send(ev, f'本群成功关注 {user_info["name"]} 的微博啦~ 有新动态会第一时间通知哦~')
+
+# 全群关注微博账号
+@sv.on_prefix(('全群关注微博', '全群订阅微博'))
+async def follow_weibo_all_groups(bot, ev: CQEvent):
+    user_id = ev.user_id
+    
+    # 仅允许管理员执行全群操作
+    if not priv.check_priv(ev, priv.ADMIN):
+        await bot.finish(ev, '只有管理员才能操作全群关注哦~')
+    
+    if not _nlmt.check(user_id):
+        await bot.finish(ev, '今日全群关注微博次数已达上限，请明天再试~')
+    if not flmt.check(user_id):
+        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')
+    
+    uid = ev.message.extract_plain_text().strip()
+    if not uid:
+        await bot.finish(ev, '请输入要全群关注的微博ID哦~')
+    
+    # 获取所有已加入的群
+    groups = await bot.get_group_list()
+    if not groups:
+        await bot.finish(ev, '未加入任何群组，无法进行全群关注~')
+    
+    # 获取用户信息
+    user_info = await get_weibo_user_info(uid)
+    latest_posts = await get_weibo_user_latest_posts(uid, 1)
+    last_post_id = latest_posts[0]['id'] if latest_posts else ''
+    
+    # 记录受影响的群数量
+    new_follow_count = 0
+    
+    for group in groups:
+        group_id = str(group['group_id'])
+        
+        # 初始化群配置（如果不存在）
+        if group_id not in weibo_config['group_follows']:
+            weibo_config['group_follows'][group_id] = {}
+        
+        # 仅处理未关注的群
+        if uid not in weibo_config['group_follows'][group_id]:
+            weibo_config['group_follows'][group_id][uid] = {
+                'name': user_info['name'],
+                'last_post_id': last_post_id
+            }
+            new_follow_count += 1
+        
+        # 确保开启推送
+        weibo_config['group_enable'][group_id] = True
+    
+    save_config()
+    _nlmt.increase(user_id)
+    flmt.start_cd(user_id)
+    await bot.send(ev, f'成功为{new_follow_count}个群开启 {user_info["name"]} 的微博关注~ 有新动态会第一时间通知哦~')
 
 # 取消关注微博账号
 @sv.on_prefix(('取消关注微博', '取消订阅微博'))
@@ -319,6 +413,7 @@ async def toggle_weibo_push(bot, ev: CQEvent):
 async def weibo_help(bot, ev: CQEvent):
     help_msg = '''微博推送插件帮助：
 - 关注微博 [微博ID]：关注指定微博账号（仅本群生效）
+- 全群关注微博 [微博ID]：所有已加入的群都关注并开启推送（管理员）
 - 取消关注微博 [微博ID]：取消关注指定微博账号（仅本群生效）
 - 查看关注的微博：查看本群已关注的微博账号
 - 微博推送开关 [on/off]：开启或关闭本群微博推送（管理员）
