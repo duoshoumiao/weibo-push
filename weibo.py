@@ -103,25 +103,62 @@ async def get_weibo_user_latest_posts(uid, count=5):
                 for card in cards:
                     if card.get('card_type') == 9:  # 微博内容卡片
                         mblog = card.get('mblog', {})
+                        
+                        # 处理微博正文（区分原创和转发）
                         raw_text = mblog.get('text', '')
+                        retweeted_status = mblog.get('retweeted_status')  # 被转发的微博数据
                         
-                        text = re.sub(r'<br\s*/?>', '\n', raw_text)  
-                        text = re.sub(r'<[^>]+>', '', text) 
-                        text = html.unescape(text) 
-                        text = text.strip() or "【无正文内容】"  
+                        if retweeted_status:
+                            # 提取被转发微博的正文
+                            retweeted_raw_text = retweeted_status.get('text', '')
+                            retweeted_text = re.sub(r'<br\s*/?>', '\n', retweeted_raw_text)
+                            retweeted_text = re.sub(r'<[^>]+>', '', retweeted_text)
+                            retweeted_text = html.unescape(retweeted_text)
+                            retweeted_text = retweeted_text.strip() or "【被转发微博无正文】"
+                            
+                            # 处理转发者添加的内容（过滤无意义内容）
+                            forward_text = re.sub(r'<br\s*/?>', '\n', raw_text)
+                            forward_text = re.sub(r'<[^>]+>', '', forward_text)
+                            forward_text = html.unescape(forward_text)
+                            forward_text = forward_text.strip()
+                            
+                            # 修复：使用Python re模块支持的语法过滤无意义内容
+                            # 匹配仅包含空白字符、标点符号和常见表情的内容
+                            meaningless_pattern = re.compile(r'^[\s!"#$%&\'()*+,-./:;<=>?@\[\\\]^_`{|}~，。、；：？！…—·《》「」『』【】（）]*$')
+                            if meaningless_pattern.match(forward_text):
+                                forward_text = ''
+                            
+                            # 组合内容
+                            if forward_text:
+                                text = f"转发说明：{forward_text}\n\n被转发内容：{retweeted_text}"
+                            else:
+                                text = f"被转发内容：{retweeted_text}"
+                        else:
+                            # 原创微博直接处理正文
+                            text = re.sub(r'<br\s*/?>', '\n', raw_text)
+                            text = re.sub(r'<[^>]+>', '', text)
+                            text = html.unescape(text)
+                            text = text.strip() or "【无正文内容】"
                         
-                        # 处理图片
-                        pics = mblog.get('pics', [])
+                        # 处理图片（优先用被转发微博的图片）
+                        if retweeted_status:
+                            pics = retweeted_status.get('pics', [])
+                        else:
+                            pics = mblog.get('pics', [])
                         pic_urls = [pic.get('large', {}).get('url', '') for pic in pics if pic.get('large')]
                         
-                        # 处理视频（包含封面）
+                        # 处理视频（优先用被转发微博的视频）
                         video_info = {
                             'urls': [],
-                            'cover_url': ''  # 新增视频封面字段
+                            'cover_url': ''
                         }
-                        page_info = mblog.get('page_info', {})
+                        if retweeted_status:
+                            page_info = retweeted_status.get('page_info', {})
+                        else:
+                            page_info = mblog.get('page_info', {})
+                            
                         if page_info.get('type') == 'video':
-                            # 获取完整的fid参数（包含前缀）并生成视频播放页链接
+                            # 获取完整的fid参数生成视频链接
                             fid = page_info.get('fid', '')
                             if fid:
                                 video_url = f"https://video.weibo.com/show?fid={fid}"
@@ -130,7 +167,6 @@ async def get_weibo_user_latest_posts(uid, count=5):
                             # 提取视频封面
                             video_info['cover_url'] = page_info.get('page_pic', {}).get('url', '')
                             if not video_info['cover_url']:
-                                # 备选方案：从其他字段获取封面
                                 video_info['cover_url'] = page_info.get('media_info', {}).get('stream_url_hd', '').replace('mp4', 'jpg')
                             
                             # 尝试获取视频直接下载链接
@@ -140,18 +176,32 @@ async def get_weibo_user_latest_posts(uid, count=5):
                                         video_info['urls'].append(pl['url'])
                                         break
                         
-                        # 应用时间格式化
-                        formatted_time = format_weibo_time(mblog.get('created_at', '未知时间'))
+                        # 应用时间格式化（转发微博用原微博时间）
+                        if retweeted_status:
+                            raw_time = retweeted_status.get('created_at', '未知时间')
+                        else:
+                            raw_time = mblog.get('created_at', '未知时间')
+                        formatted_time = format_weibo_time(raw_time)
+                        
+                        # 统计数据（转发微博用原微博数据）
+                        if retweeted_status:
+                            reposts_count = retweeted_status.get('reposts_count', 0)
+                            comments_count = retweeted_status.get('comments_count', 0)
+                            attitudes_count = retweeted_status.get('attitudes_count', 0)
+                        else:
+                            reposts_count = mblog.get('reposts_count', 0)
+                            comments_count = mblog.get('comments_count', 0)
+                            attitudes_count = mblog.get('attitudes_count', 0)
                         
                         posts.append({
                             'id': mblog.get('id', ''),
                             'text': text,
                             'pics': pic_urls,
-                            'video': video_info,  # 视频信息（包含封面和链接）
+                            'video': video_info,
                             'created_at': formatted_time, 
-                            'reposts_count': mblog.get('reposts_count', 0),
-                            'comments_count': mblog.get('comments_count', 0),
-                            'attitudes_count': mblog.get('attitudes_count', 0)
+                            'reposts_count': reposts_count,
+                            'comments_count': comments_count,
+                            'attitudes_count': attitudes_count
                         })
                         
                         if len(posts) >= count:
