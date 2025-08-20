@@ -121,9 +121,11 @@ async def get_weibo_user_latest_posts(uid, count=5):
                         }
                         page_info = mblog.get('page_info', {})
                         if page_info.get('type') == 'video':
-                            # 获取视频播放页链接
-                            video_url = f"https://video.weibo.com/show?fid={page_info.get('fid', '')}"
-                            video_info['urls'].append(video_url)
+                            # 获取完整的fid参数（包含前缀）并生成视频播放页链接
+                            fid = page_info.get('fid', '')
+                            if fid:
+                                video_url = f"https://video.weibo.com/show?fid={fid}"
+                                video_info['urls'].append(video_url)
                             
                             # 提取视频封面
                             video_info['cover_url'] = page_info.get('page_pic', {}).get('url', '')
