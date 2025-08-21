@@ -10,7 +10,6 @@ import html
 from datetime import datetime  
 from nonebot import on_startup
 
-
 sv = Service('微博推送', visible=True, enable_on_default=True, help_='微博推送服务')
 
 # 配置文件路径
@@ -86,7 +85,7 @@ async def get_weibo_user_info(uid):
         sv.logger.error(f"获取微博用户信息失败: {e}")
         return {'name': f'用户{uid}', 'uid': uid}
 
-# 获取微博用户最新微博（包含视频封面提取）
+# 获取微博用户最新微博（重点修复视频链接和封面解析）
 async def get_weibo_user_latest_posts(uid, count=5):
     url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1'
     try:
@@ -122,8 +121,7 @@ async def get_weibo_user_latest_posts(uid, count=5):
                             forward_text = html.unescape(forward_text)
                             forward_text = forward_text.strip()
                             
-                            # 修复：使用Python re模块支持的语法过滤无意义内容
-                            # 匹配仅包含空白字符、标点符号和常见表情的内容
+                            # 过滤无意义内容
                             meaningless_pattern = re.compile(r'^[\s!"#$%&\'()*+,-./:;<=>?@\[\\\]^_`{|}~，。、；：？！…—·《》「」『』【】（）]*$')
                             if meaningless_pattern.match(forward_text):
                                 forward_text = ''
@@ -147,34 +145,45 @@ async def get_weibo_user_latest_posts(uid, count=5):
                             pics = mblog.get('pics', [])
                         pic_urls = [pic.get('large', {}).get('url', '') for pic in pics if pic.get('large')]
                         
-                        # 处理视频（优先用被转发微博的视频）
+                        # 处理视频（优先用被转发微博的视频，重点修复解析逻辑）
                         video_info = {
-                            'urls': [],
-                            'cover_url': ''
+                            'play_page_url': '',  # 播放页链接
+                            'cover_url': '',       # 封面链接
                         }
-                        if retweeted_status:
-                            page_info = retweeted_status.get('page_info', {})
-                        else:
-                            page_info = mblog.get('page_info', {})
-                            
-                        if page_info.get('type') == 'video':
-                            # 获取完整的fid参数生成视频链接
-                            fid = page_info.get('fid', '')
+                        # 优先取转发微博的page_info
+                        page_info = retweeted_status.get('page_info', {}) if retweeted_status else mblog.get('page_info', {})
+                        
+                        # 调试：打印page_info原始数据
+                        sv.logger.debug(f"微博page_info数据: {page_info}")
+                        
+                        if page_info.get('type') in ['video', 'weibo_video']:  # 兼容视频类型
+                            # 提取播放页链接（优先用fid，兼容object_id）
+                            fid = page_info.get('fid') or page_info.get('object_id')
                             if fid:
-                                video_url = f"https://video.weibo.com/show?fid={fid}"
-                                video_info['urls'].append(video_url)
+                                video_info['play_page_url'] = f"https://video.weibo.com/show?fid={fid}"
                             
-                            # 提取视频封面
+                            # 提取封面链接（多来源尝试）
+                            # 1. 优先从page_pic获取
                             video_info['cover_url'] = page_info.get('page_pic', {}).get('url', '')
+                            # 2. 从media_info的封面字段获取
                             if not video_info['cover_url']:
-                                video_info['cover_url'] = page_info.get('media_info', {}).get('stream_url_hd', '').replace('mp4', 'jpg')
-                            
-                            # 尝试获取视频直接下载链接
-                            if 'playback_list' in page_info:
-                                for pl in page_info['playback_list']:
-                                    if pl.get('url'):
-                                        video_info['urls'].append(pl['url'])
-                                        break
+                                video_info['cover_url'] = page_info.get('media_info', {}).get('cover_image_url', '')
+                            # 3. 从stream_url替换（备用方案）
+                            if not video_info['cover_url']:
+                                stream_url = page_info.get('media_info', {}).get('stream_url_hd', '')
+                                if stream_url:
+                                    # 简单替换后缀（根据实际情况调整，比如部分封面是独立字段）
+                                    video_info['cover_url'] = stream_url.replace('.mp4', '.jpg').replace('.webm', '.jpg')
+                        
+                        # 处理视频链接显示（在推送部分）
+                        # 处理视频（先显示封面，再显示链接）
+                        if video_info['play_page_url']:
+                            # 显示视频封面（如果有）
+                            if video_info['cover_url']:
+                                escaped_cover_url = escape(video_info['cover_url'])
+                                text += f"\n[CQ:image,url={escaped_cover_url}]"
+                            # 显示播放页链接
+                            text += f"\n🎬 视频播放页：{video_info['play_page_url']}"
                         
                         # 应用时间格式化（转发微博用原微博时间）
                         if retweeted_status:
@@ -253,46 +262,27 @@ async def push_weibo_to_groups(group_ids, name, post):
     msg_parts = []
     
     msg_parts.append(f"📢 {name} 发布新微博：\n")
-    
     msg_parts.append(f"{post['text']}\n\n")
     
     # 处理图片
-    for i, pic_url in enumerate(post['pics']):
+    for pic_url in post['pics']:
         if pic_url:
             escaped_url = escape(pic_url)
-            # 如果是最后一张图且没有视频，不加换行
-            if i == len(post['pics']) - 1 and not post['video']['urls']:
-                msg_parts.append(f"[CQ:image,url={escaped_url}]")
-            else:
-                msg_parts.append(f"[CQ:image,url={escaped_url}]\n")
+            msg_parts.append(f"[CQ:image,url={escaped_url}]\n")
     
-    # 处理视频（先显示封面，再显示链接）
-    if post['video']['urls']:
-        # 显示视频封面
-        if post['video']['cover_url']:
-            escaped_cover_url = escape(post['video']['cover_url'])
-            msg_parts.append(f"[CQ:image,url={escaped_cover_url}]\n")
-        
-        # 显示视频链接
-        msg_parts.append("🎬 视频链接：\n")
-        for i, video_url in enumerate(post['video']['urls']):
-            if video_url.startswith('http'):
-                if i == 0:
-                    msg_parts.append(f"[播放页] {video_url}\n")
-                else:
-                    msg_parts.append(f"[下载链接] {video_url}\n")
+    # 处理视频播放页和封面
+    # if post['video']['play_page_url']:
+        # msg_parts.append(f"🎬 视频播放页：{post['video']['play_page_url']}\n")
+        # if post['video']['cover_url']:
+            # escaped_cover = escape(post['video']['cover_url'])
+            # msg_parts.append(f"[CQ:image,url={escaped_cover}]\n")
     
     # 统计信息与链接
-    if post['text'] or post['pics'] or post['video']['urls']:
-        msg_parts.append(f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}")
-        msg_parts.append(f"\n发布时间：{post['created_at']}") 
-        msg_parts.append(f"\n原文链接：https://m.weibo.cn/status/{post['id']}")
+    msg_parts.append(f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}")
+    msg_parts.append(f"\n发布时间：{post['created_at']}") 
+    msg_parts.append(f"\n原文链接：https://m.weibo.cn/status/{post['id']}")
     
-    # 合并为完整消息
     full_message = ''.join(msg_parts)
-    
-    # 调试日志
-    sv.logger.debug(f"推送消息内容: {full_message[:200]}...")
     
     # 发送到目标群
     for group_id in group_ids:
