@@ -262,7 +262,12 @@ async def check_and_push_new_weibo():
             if groups_to_push:
                 save_config()
                 user_info = await get_weibo_user_info(uid)
-                await push_weibo_to_groups(groups_to_push, user_info['name'], latest_post)
+                # 修复：确保传递uid参数给推送函数
+                if user_info:
+                    await push_weibo_to_groups(groups_to_push, user_info['name'], uid, latest_post)
+                else:
+                    # 即使获取用户信息失败也尝试推送，使用已知的uid
+                    await push_weibo_to_groups(groups_to_push, f'用户{uid}', uid, latest_post)
             
         except Exception as e:
             sv.logger.error(f"处理微博 {uid} 时出错: {e}")
@@ -271,9 +276,10 @@ async def check_and_push_new_weibo():
     sv.logger.info("微博更新检查完成")
 
 # 推送微博到指定群列表（包含视频封面显示）
-async def push_weibo_to_groups(group_ids, name, post):
+async def push_weibo_to_groups(group_ids, name, uid, post):
     msg_parts = []
     
+    # 使用传入的uid参数
     msg_parts.append(f"📢 {name} (ID: {uid}) 发布新微博：\n")
     msg_parts.append(f"{post['text']}\n\n")
     
@@ -282,13 +288,6 @@ async def push_weibo_to_groups(group_ids, name, post):
         if pic_url:
             escaped_url = escape(pic_url)
             msg_parts.append(f"[CQ:image,url={escaped_url}]\n")
-    
-    # 处理视频播放页和封面
-    # if post['video']['play_page_url']:
-        # msg_parts.append(f"🎬 视频播放页：{post['video']['play_page_url']}\n")
-        # if post['video']['cover_url']:
-            # escaped_cover = escape(post['video']['cover_url'])
-            # msg_parts.append(f"[CQ:image,url={escaped_cover}]\n")
     
     # 统计信息与链接
     msg_parts.append(f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}")
@@ -453,31 +452,10 @@ async def remove_blacklist(bot, ev: CQEvent):
     save_config()
     await bot.send(ev, f'已成功将微博ID({uid})从黑名单中移除~')
 
-@sv.on_fullmatch(('查看微博黑名单', '微博黑名单列表'))
-async def list_blacklist(bot, ev: CQEvent):
-    # 仅允许管理员查看
-    if not priv.check_priv(ev, priv.ADMIN):
-        await bot.finish(ev, '只有管理员才能查看黑名单哦~')
-    
-    if not weibo_config['blacklist']:
-        await bot.finish(ev, '当前没有任何微博ID在黑名单中~')
-    
-    msg = ['微博黑名单列表：\n']
-    for i, uid in enumerate(weibo_config['blacklist'], 1):
-        msg.append(f"{i}. {uid}\n")
-    
-    msg.append('\n可以使用"微博黑名单移除 [ID]"来解除限制~')
-    await bot.send(ev, ''.join(msg))
-    
 # 取消关注微博账号
 @sv.on_prefix(('取消关注微博', '取消订阅微博'))
 async def unfollow_weibo(bot, ev: CQEvent):
     group_id = str(ev.group_id)
-    user_id = ev.user_id
-    
-    if not flmt.check(user_id):
-        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')
-    
     uid = ev.message.extract_plain_text().strip()
     if not uid:
         await bot.finish(ev, '请输入要取消关注的微博ID哦~')
@@ -487,27 +465,22 @@ async def unfollow_weibo(bot, ev: CQEvent):
     
     name = weibo_config['group_follows'][group_id][uid]['name']
     del weibo_config['group_follows'][group_id][uid]
-    if not weibo_config['group_follows'][group_id]:
-        del weibo_config['group_follows'][group_id]
-    
     save_config()
-    flmt.start_cd(user_id)
     await bot.send(ev, f'本群已取消关注 {name} 的微博~')
 
-# 查看本群关注的微博账号
-@sv.on_fullmatch(('查看关注的微博', '我的关注微博', '微博关注列表'))
+# 查看已关注的微博账号
+@sv.on_fullmatch(('查看关注的微博', '查看订阅的微博'))
 async def list_followed_weibo(bot, ev: CQEvent):
     group_id = str(ev.group_id)
+    follows = weibo_config['group_follows'].get(group_id, {})
+    if not follows:
+        await bot.finish(ev, '本群还没有关注任何微博账号哦~')
     
-    if group_id not in weibo_config['group_follows'] or not weibo_config['group_follows'][group_id]:
-        await bot.finish(ev, '本群还没有关注任何微博账号哦~ 可以使用"关注微博 [ID]"来关注~')
-    
-    msg = ['本群关注的微博账号：\n']
-    for i, (uid, info) in enumerate(weibo_config['group_follows'][group_id].items(), 1):
-        msg.append(f"{i}. {info['name']} (ID: {uid})\n")
-    
-    msg.append('\n可以使用"取消关注微博 [ID]"来取消关注~')
-    await bot.send(ev, ''.join(msg))
+    msg = "本群关注的微博账号：\n"
+    for uid, info in follows.items():
+        msg += f"- {info['name']} (ID: {uid})\n"
+    msg += "\n取消关注请使用：取消关注微博 [ID]"
+    await bot.send(ev, msg)
 
 # 本群微博推送开关
 @sv.on_prefix(('微博推送开关', '微博订阅开关'))
@@ -543,6 +516,21 @@ async def weibo_help(bot, ev: CQEvent):
 - 查看微博黑名单：查看当前黑名单中的微博ID（管理员）
 注：微博ID是指微博的数字ID，不是昵称哦~'''
     await bot.send(ev, help_msg)
+
+# 查看微博黑名单
+@sv.on_fullmatch(('查看微博黑名单',))
+async def check_blacklist(bot, ev: CQEvent):
+    if not priv.check_priv(ev, priv.ADMIN):
+        await bot.finish(ev, '只有管理员才能查看黑名单哦~')
+    
+    if not weibo_config['blacklist']:
+        await bot.send(ev, '当前黑名单为空~')
+        return
+    
+    msg = "当前微博黑名单中的ID：\n"
+    for uid in weibo_config['blacklist']:
+        msg += f"- {uid}\n"
+    await bot.send(ev, msg)
 
 @on_startup
 async def startup_check():
