@@ -19,12 +19,12 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'weibo_config.json')
 flmt = FreqLimiter(10)
 _nlmt = DailyNumberLimiter(20000)
 
-#在配置中添加黑名单
+# 配置结构调整：黑名单改为群内独立
 weibo_config = {
     'group_follows': {},      # {group_id: {weibo_id: {name: '微博名', last_post_id: '最后一条ID'}}}
     'group_enable': {},       # {group_id: True/False}
     'account_cache': {},      # {weibo_id: {name: '微博名', uid: '微博ID'}}
-    'blacklist': set()        # 新增：存储被禁止关注的微博ID
+    'group_blacklist': {}     # {group_id: set(weibo_id)} 每个群单独的黑名单
 }
 
 
@@ -45,15 +45,21 @@ def load_config():
             # 处理原有字段
             for key in ['group_follows', 'group_enable', 'account_cache']:
                 weibo_config[key] = loaded_config.get(key, {})
-            # 处理黑名单，确保是集合类型
-            weibo_config['blacklist'] = set(loaded_config.get('blacklist', []))
+            # 处理群黑名单，确保每个群的黑名单是集合类型
+            weibo_config['group_blacklist'] = {}
+            group_blacklist_loaded = loaded_config.get('group_blacklist', {})
+            for group_id, uids in group_blacklist_loaded.items():
+                weibo_config['group_blacklist'][group_id] = set(uids)
     else:
         save_config()
 
 def save_config():
     # 转换集合为列表以便JSON序列化
     config_to_save = weibo_config.copy()
-    config_to_save['blacklist'] = list(weibo_config['blacklist'])
+    # 处理群黑名单
+    config_to_save['group_blacklist'] = {}
+    for group_id, uids in weibo_config['group_blacklist'].items():
+        config_to_save['group_blacklist'][group_id] = list(uids)
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(config_to_save, f, ensure_ascii=False, indent=2)
 
@@ -324,9 +330,10 @@ async def follow_weibo(bot, ev: CQEvent):
     if not uid:
         await bot.finish(ev, '请输入要关注的微博ID哦~')
     
-    # 检查是否在黑名单中
-    if uid in weibo_config['blacklist']:
-        await bot.finish(ev, f'该微博ID({uid})已被禁止关注~')
+    # 检查是否在本群黑名单中
+    group_blacklist = weibo_config['group_blacklist'].get(group_id, set())
+    if uid in group_blacklist:
+        await bot.finish(ev, f'该微博ID({uid})已在本群黑名单中，禁止关注~')
     
     # 验证微博ID有效性
     user_info = await get_weibo_user_info(uid)
@@ -356,7 +363,7 @@ async def follow_weibo(bot, ev: CQEvent):
     flmt.start_cd(user_id)
     await bot.send(ev, f'本群成功关注 {user_info["name"]} 的微博啦~ 有新动态会第一时间通知哦~')
 
-# 修改全群关注微博功能，添加有效性检查和黑名单检查
+# 全群关注微博功能
 @sv.on_prefix(('全群关注微博', '全群订阅微博'))
 async def follow_weibo_all_groups(bot, ev: CQEvent):
     user_id = ev.user_id
@@ -373,10 +380,6 @@ async def follow_weibo_all_groups(bot, ev: CQEvent):
     uid = ev.message.extract_plain_text().strip()
     if not uid:
         await bot.finish(ev, '请输入要全群关注的微博ID哦~')
-    
-    # 检查是否在黑名单中
-    if uid in weibo_config['blacklist']:
-        await bot.finish(ev, f'该微博ID({uid})已被禁止关注~')
     
     # 验证微博ID有效性
     user_info = await get_weibo_user_info(uid)
@@ -396,6 +399,11 @@ async def follow_weibo_all_groups(bot, ev: CQEvent):
     
     for group in groups:
         group_id = str(group['group_id'])
+        
+        # 检查该群是否将该uid加入黑名单，若是则跳过
+        group_blacklist = weibo_config['group_blacklist'].get(group_id, set())
+        if uid in group_blacklist:
+            continue  # 跳过该群
         
         # 初始化群配置（如果不存在）
         if group_id not in weibo_config['group_follows']:
@@ -417,23 +425,36 @@ async def follow_weibo_all_groups(bot, ev: CQEvent):
     flmt.start_cd(user_id)
     await bot.send(ev, f'成功为{new_follow_count}个群开启 {user_info["name"]} 的微博关注~ 有新动态会第一时间通知哦~')
 
-# 新增：黑名单管理命令
+# 群内黑名单管理命令
 @sv.on_prefix(('微博黑名单', '添加微博黑名单'))
 async def add_blacklist(bot, ev: CQEvent):
     # 仅允许管理员操作
     if not priv.check_priv(ev, priv.ADMIN):
         await bot.finish(ev, '只有管理员才能操作黑名单哦~')
     
+    group_id = str(ev.group_id)
     uid = ev.message.extract_plain_text().strip()
     if not uid:
         await bot.finish(ev, '请输入要加入黑名单的微博ID哦~')
     
-    if uid in weibo_config['blacklist']:
-        await bot.finish(ev, f'微博ID({uid})已在黑名单中~')
+    # 初始化该群的黑名单（如果不存在）
+    if group_id not in weibo_config['group_blacklist']:
+        weibo_config['group_blacklist'][group_id] = set()
     
-    weibo_config['blacklist'].add(uid)
+    if uid in weibo_config['group_blacklist'][group_id]:
+        await bot.finish(ev, f'该微博ID({uid})已在本群黑名单中~')
+    
+    # 加入黑名单
+    weibo_config['group_blacklist'][group_id].add(uid)
+    
+    # 自动取消该群对该ID的关注
+    if group_id in weibo_config['group_follows'] and uid in weibo_config['group_follows'][group_id]:
+        del weibo_config['group_follows'][group_id][uid]
+        save_config()  # 先保存取消关注的修改
+        await bot.send(ev, f'已自动取消本群对微博ID({uid})的关注~')
+    
     save_config()
-    await bot.send(ev, f'已成功将微博ID({uid})加入黑名单，禁止关注~')
+    await bot.send(ev, f'已成功将微博ID({uid})加入本群黑名单，禁止关注~')
 
 @sv.on_prefix(('微博黑名单移除', '移除微博黑名单'))
 async def remove_blacklist(bot, ev: CQEvent):
@@ -441,16 +462,19 @@ async def remove_blacklist(bot, ev: CQEvent):
     if not priv.check_priv(ev, priv.ADMIN):
         await bot.finish(ev, '只有管理员才能操作黑名单哦~')
     
+    group_id = str(ev.group_id)
     uid = ev.message.extract_plain_text().strip()
     if not uid:
         await bot.finish(ev, '请输入要移除黑名单的微博ID哦~')
     
-    if uid not in weibo_config['blacklist']:
-        await bot.finish(ev, f'微博ID({uid})不在黑名单中~')
+    # 检查该群黑名单是否存在
+    if group_id not in weibo_config['group_blacklist'] or uid not in weibo_config['group_blacklist'][group_id]:
+        await bot.finish(ev, f'该微博ID({uid})不在本群黑名单中~')
     
-    weibo_config['blacklist'].remove(uid)
+    # 移除黑名单
+    weibo_config['group_blacklist'][group_id].remove(uid)
     save_config()
-    await bot.send(ev, f'已成功将微博ID({uid})从黑名单中移除~')
+    await bot.send(ev, f'已成功将微博ID({uid})从本群黑名单中移除~')
 
 # 取消关注微博账号
 @sv.on_prefix(('取消关注微博', '取消订阅微博'))
@@ -511,24 +535,27 @@ async def weibo_help(bot, ev: CQEvent):
 - 取消关注微博 [微博ID]：取消关注指定微博账号（仅本群生效）
 - 查看关注的微博：查看本群已关注的微博账号
 - 微博推送开关 [on/off]：开启或关闭本群微博推送（管理员）
-- 微博黑名单 [ID]：将指定微博ID加入黑名单（管理员）
-- 微博黑名单移除 [ID]：将指定微博ID从黑名单移除（管理员）
-- 查看微博黑名单：查看当前黑名单中的微博ID（管理员）
+- 微博黑名单 [ID]：将指定微博ID加入本群黑名单（管理员）
+- 微博黑名单移除 [ID]：将指定微博ID从本群黑名单移除（管理员）
+- 查看微博黑名单：查看本群黑名单中的微博ID（管理员）
 注：微博ID是指微博的数字ID，不是昵称哦~'''
     await bot.send(ev, help_msg)
 
-# 查看微博黑名单
+# 查看本群微博黑名单
 @sv.on_fullmatch(('查看微博黑名单',))
 async def check_blacklist(bot, ev: CQEvent):
     if not priv.check_priv(ev, priv.ADMIN):
         await bot.finish(ev, '只有管理员才能查看黑名单哦~')
     
-    if not weibo_config['blacklist']:
-        await bot.send(ev, '当前黑名单为空~')
+    group_id = str(ev.group_id)
+    blacklist = weibo_config['group_blacklist'].get(group_id, set())
+    
+    if not blacklist:
+        await bot.send(ev, '本群黑名单为空~')
         return
     
-    msg = "当前微博黑名单中的ID：\n"
-    for uid in weibo_config['blacklist']:
+    msg = "本群微博黑名单中的ID：\n"
+    for uid in blacklist:
         msg += f"- {uid}\n"
     await bot.send(ev, msg)
 
