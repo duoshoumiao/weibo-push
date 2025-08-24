@@ -311,7 +311,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
             sv.logger.error(f"向群 {group_id} 推送失败: {e}，消息预览: {full_message[:200]}...")
 
 # 定时任务：每1分钟检查一次
-@sv.scheduled_job('interval', minutes=1)
+@sv.scheduled_job('interval', minutes=10)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
