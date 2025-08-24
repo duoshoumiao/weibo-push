@@ -77,8 +77,8 @@ headers = {
     'Accept': 'application/json, text/plain, */*',
     'Referer': 'https://m.weibo.cn/',
     'X-Requested-With': 'XMLHttpRequest',
-    'Cookie': 'SCF=AoSBzJSk8NJBjACijg-DwFAuzw0_-DIWQTOgTiaNVpeJPyhwC7ayyZjDZTGOdVcNXvv1wUsTt6C1Q5R7x0ujcSg.; SINAGLOBAL=2171047519112.6987.1754886255230; UOR=,,www.doubao.com; ULV=1755743469490:9:9:4:908131278112.565.1755743469408:1755690427342; SUB=_2A25Fo643DeRhGeBM6VIX9CjJzDqIHXVmwK__rDV8PUNbmtANLUGnkW9NROIKF5bwiSemfKlI2QD23VR6GvroVRu5; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9Whf44reS4FM0yqHofyYWyqT5JpX5KzhUgL.FoqEeo5cShqfS0q2dJLoIpMLxKnL12-LBo2LxK-LB--L1-x7MJL_9Btt; ALF=02_1758423911; XSRF-TOKEN=B5TW9C4hG6ZwoEfd8w9nkFU3; WBPSESS=GorFbSecsDrEKtrITJcA_6ilfbhSxLCNmTRnmt8pjpB5PZEy2Z-htIPCc_BlkelCdAKp9Cu2Q_RyxH-PyEHFaSRPBmQUlMyiH842WTpLA5hwiPSGs5De0BUBTrgVy0gO6prjXv6I5A4vmMD4EQ7_VA==',  # 必改：例：SUB=xxx; XSRF-TOKEN=xxx; ...
-    'X-XSRF-TOKEN': 'B5TW9C4hG6ZwoEfd8w9nkFU3'  # 必改：例：abc123def456
+    'Cookie': 'XXXXXXXX',  # 必改：例：SUB=xxx; XSRF-TOKEN=xxx; ...
+    'X-XSRF-TOKEN': 'XXXXXXX'  # 必改：例：abc123def456
 }
 # -----------------------------------------------------------------------------
 
