@@ -1,6 +1,8 @@
 # weibo-push
 支持hoshino v1
 
+自行提取cookie填入80-81
+
 微博关注小插件
 
 微博推送帮助
