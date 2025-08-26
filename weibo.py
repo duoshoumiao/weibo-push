@@ -9,9 +9,13 @@ import re
 import html
 from datetime import datetime  
 from nonebot import on_startup
+import json
+import os
 
 sv = Service('微博推送', visible=True, enable_on_default=True, help_='微博推送服务')
 
+# 定义数据文件路径
+DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
 # 配置文件路径
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'weibo_config.json')
 
@@ -64,10 +68,34 @@ def save_config():
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(config_to_save, f, ensure_ascii=False, indent=2)
 
+# 初始化数据文件和headers
+def init_data():
+    # 确保数据文件存在
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                'cookie': '',
+                'xsrf_token': ''
+            }, f, ensure_ascii=False, indent=2)
+        return {'cookie': '', 'xsrf_token': ''}
+    
+    # 读取现有数据
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        # 数据文件损坏时重建
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                'cookie': '',
+                'xsrf_token': ''
+            }, f, ensure_ascii=False, indent=2)
+        return {'cookie': '', 'xsrf_token': ''}
 
+# 初始化数据
+data = init_data()
 # 初始化配置
 load_config()
-
 # -------------------------- 关键修复：补充完整请求头 --------------------------
 # 1. 打开 https://m.weibo.cn/ 登录账号
 # 2. F12打开开发者工具 → Network标签 → 刷新页面 → 选任意getIndex请求
@@ -77,8 +105,8 @@ headers = {
     'Accept': 'application/json, text/plain, */*',
     'Referer': 'https://m.weibo.cn/',
     'X-Requested-With': 'XMLHttpRequest',
-    'Cookie': 'XXXXXXXX',  # 必改：例：SUB=xxx; XSRF-TOKEN=xxx; ...
-    'X-XSRF-TOKEN': 'XXXXXXX'  # 必改：例：abc123def456
+    'Cookie': data['cookie'], 
+    'X-XSRF-TOKEN': data['xsrf_token'] 
 }
 # -----------------------------------------------------------------------------
 
@@ -528,6 +556,7 @@ async def weibo_help(bot, ev: CQEvent):
 - 微博黑名单 [ID]：将指定微博ID加入本群黑名单（管理员）
 - 微博黑名单移除 [ID]：将指定微博ID从本群黑名单移除（管理员）
 - 查看微博黑名单：查看本群黑名单中的微博ID（管理员）
+- 更新cookie + cookie
 注：微博ID是指微博的数字ID，不是昵称哦~'''
     await bot.send(ev, help_msg)
 
@@ -549,8 +578,45 @@ async def check_blacklist(bot, ev: CQEvent):
         msg += f"- {uid}\n"
     await bot.send(ev, msg)
 
-# @on_startup
-# async def startup_check():
-    # sv.logger.info("微博推送插件已启动，正在进行首次微博检查...")
-    # await asyncio.sleep(10)  # 延迟检查，避免启动冲突
-    # await check_and_push_new_weibo()
+@sv.on_prefix(('更新cookie',))
+async def update_cookie(bot, ev: CQEvent):
+    # 仅允许管理员操作
+    if not priv.check_priv(ev, priv.ADMIN):
+        await bot.finish(ev, '只有管理员才能更新Cookie哦~')
+    
+    new_cookie = ev.message.extract_plain_text().strip()
+    if not new_cookie:
+        await bot.finish(ev, '请输入完整的Cookie内容哦~')
+    
+    # 尝试从Cookie中提取XSRF-TOKEN
+    xsrf_token = None
+    for part in new_cookie.split(';'):
+        part = part.strip()
+        if part.startswith('XSRF-TOKEN='):
+            xsrf_token = part.split('=', 1)[1]
+            break
+    
+    if not xsrf_token:
+        await bot.finish(ev, '未从Cookie中找到XSRF-TOKEN，请检查Cookie格式是否正确~')
+    
+    # 更新全局headers
+    global headers
+    headers['Cookie'] = new_cookie
+    headers['X-XSRF-TOKEN'] = xsrf_token
+    
+    # 保存到数据文件（持久化）
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump({
+            'cookie': new_cookie,
+            'xsrf_token': xsrf_token
+        }, f, ensure_ascii=False, indent=2)
+    
+    await bot.send(ev, 'Cookie和X-XSRF-TOKEN已更新并保存，重启后仍会生效~')
+    
+    # 测试新配置是否有效
+    test_uid = '1669879400'  # 新浪新闻的微博ID，用于测试
+    test_result = await get_weibo_user_info(test_uid, retry=1)
+    if test_result:
+        await bot.send(ev, f'新配置测试成功，已获取到测试账号信息：{test_result["name"]}')
+    else:
+        await bot.send(ev, '新配置测试失败，可能Cookie已过期或格式错误，请重新检查~')
