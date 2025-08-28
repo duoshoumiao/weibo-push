@@ -24,7 +24,9 @@
 查看微博黑名单：查看当前黑名单中的微博ID（管理员）
 
 更新cookie + cookie  浏览器F12 搜TOKEN
+
  <img width="463" height="260" alt="image" src="https://github.com/user-attachments/assets/09840b95-e092-4ad8-87eb-094447d75221" />
+
 注：微博ID是指微博的数字ID，不是昵称哦~
 
 <img width="440" height="713" alt="image" src="https://github.com/user-attachments/assets/7fd5f877-60aa-4e28-8f3f-9731e9177508" />
