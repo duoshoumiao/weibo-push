@@ -128,7 +128,7 @@ async def get_weibo_user_info(uid, retry=2):
                     # 校验响应是否为JSON
                     if 'application/json' not in resp.headers.get('Content-Type', ''):
                         sv.logger.warning(f"用户{uid}信息非JSON响应，重试中")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(3)
                         continue
                     
                     data = await resp.json()
@@ -145,10 +145,10 @@ async def get_weibo_user_info(uid, retry=2):
                         save_config()
                         return result
                     sv.logger.warning(f"用户{uid}信息获取失败，API返回: {data}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)
         except Exception as e:
             sv.logger.error(f"用户{uid}信息请求异常: {e}，重试中")
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
     
     sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数）")
     return None
@@ -165,13 +165,13 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                     if 'application/json' not in resp.headers.get('Content-Type', ''):
                         resp_text = await resp.text()[:200]  # 打印前200字符排查
                         sv.logger.warning(f"微博{uid}非JSON响应: {resp_text}，重试中")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(3)
                         continue
                     
                     data = await resp.json()
                     if data.get('ok') != 1:
                         sv.logger.warning(f"微博{uid}获取失败，API返回: {data}，重试中")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(3)
                         continue
                     
                     # 解析微博内容
@@ -252,7 +252,7 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                     return posts
         except Exception as e:
             sv.logger.error(f"微博{uid}请求异常: {e}，重试中")
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
     
     sv.logger.error(f"微博{uid}获取失败（已达最大重试次数）")
     return []
@@ -323,13 +323,13 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
     for group_id in group_ids:
         try:
             await sv.bot.send_group_msg(group_id=int(group_id), message=full_msg)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(3)
         except Exception as e:
             sv.logger.error(f"向群{group_id}推送失败: {e}，消息预览: {full_msg[:200]}...")
 
 
 # -------------------------- 定时任务（调整为5分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=5)
+@sv.scheduled_job('interval', minutes=6)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
@@ -611,10 +611,10 @@ async def update_cookie(bot, ev: CQEvent):
             'xsrf_token': xsrf_token
         }, f, ensure_ascii=False, indent=2)
     
-    await bot.send(ev, 'Cookie和X-XSRF-TOKEN已更新并保存，重启后仍会生效~')
+    await bot.send(ev, '')
     
     # 测试新配置是否有效
-    test_uid = '1669879400'  # 新浪新闻的微博ID，用于测试
+    test_uid = '6220646576'  # 新浪新闻的微博ID，用于测试
     test_result = await get_weibo_user_info(test_uid, retry=1)
     if test_result:
         await bot.send(ev, f'新配置测试成功，已获取到测试账号信息：{test_result["name"]}')
