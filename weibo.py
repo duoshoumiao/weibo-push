@@ -160,12 +160,13 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     for _ in range(retry + 1):
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(url, timeout=10) as resp:
-                    # 校验响应是否为JSON
-                    if 'application/json' not in resp.headers.get('Content-Type', ''):
-                        resp_text = await resp.text()[:200]  # 打印前200字符排查
-                        sv.logger.warning(f"微博{uid}非JSON响应: {resp_text}，重试中")
-                        await asyncio.sleep(3)
+                async with session.get(url, timeout=10) as resp:  
+                    # 校验响应是否为JSON  
+                    if 'application/json' not in resp.headers.get('Content-Type', ''):  
+                        full_text = await resp.text()  
+                        resp_text = full_text[:200]  # 打印前200字符排查  
+                        sv.logger.warning(f"微博{uid}非JSON响应: {resp_text}，重试中")  
+                        await asyncio.sleep(1)  
                         continue
                     
                     data = await resp.json()
@@ -250,11 +251,11 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                             break
                     
                     return posts
-        except Exception as e:
-            sv.logger.error(f"微博{uid}请求异常: {e}，重试中")
-            await asyncio.sleep(3)
+        except Exception as e:  
+            sv.logger.error(f"微博{uid}请求异常: {type(e).__name__}: {e}，重试中")  
+            await asyncio.sleep(1)  
     
-    sv.logger.error(f"微博{uid}获取失败（已达最大重试次数）")
+    sv.logger.error(f"微博{uid}获取失败（已达最大重试次数），返回空列表")  
     return []
 
 
@@ -269,11 +270,12 @@ async def check_and_push_new_weibo():
     for uid in all_followed_uids:
         try:
             latest_posts = await get_weibo_user_latest_posts(uid)
-            if not latest_posts:
+            if not latest_posts or not isinstance(latest_posts, list): 
+                sv.logger.warning(f"微博{uid}返回数据异常: {type(latest_posts)}")  
                 continue
             
             # 按ID倒序，取最新一条
-            latest_post = max(latest_posts, key=lambda x: x['id'])
+            latest_post = max(latest_posts, key=lambda x: x.get('id', ''))
             latest_post_id = latest_post['id']
             
             # 筛选需要推送的群（已开启推送+未推送过该条）
@@ -329,7 +331,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
 
 
 # -------------------------- 定时任务（调整为5分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=6)
+@sv.scheduled_job('interval', minutes=5)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
@@ -366,7 +368,7 @@ async def follow_weibo(bot, ev: CQEvent):
         await bot.finish(ev, f'本群已经关注过 {name} 啦~')
     
     latest_posts = await get_weibo_user_latest_posts(uid, 1)
-    last_post_id = latest_posts[0]['id'] if latest_posts else ''
+    last_post_id = latest_posts[0]['id'] if latest_posts and len(latest_posts) > 0 else ''
     
     weibo_config['group_follows'][group_id][uid] = {
         'name': user_info['name'],
@@ -410,7 +412,7 @@ async def follow_weibo_all_groups(bot, ev: CQEvent):
         await bot.finish(ev, '未加入任何群组，无法进行全群关注~')
     
     latest_posts = await get_weibo_user_latest_posts(uid, 1)
-    last_post_id = latest_posts[0]['id'] if latest_posts else ''
+    last_post_id = latest_posts[0]['id'] if latest_posts and len(latest_posts) > 0 else ''
     
     # 记录受影响的群数量
     new_follow_count = 0
