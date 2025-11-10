@@ -578,6 +578,49 @@ async def check_blacklist(bot, ev: CQEvent):
         msg += f"- {uid}\n"
     await bot.send(ev, msg)
 
+@sv.on_prefix(('查看微博',))  
+async def view_weibo(bot, ev: CQEvent):  
+    user_id = ev.user_id  
+      
+    # 频率限制  
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日查看微博次数已达上限,请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦,请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    uid = ev.message.extract_plain_text().strip()  
+    if not uid:  
+        await bot.finish(ev, '请输入要查看的微博ID哦~')  
+      
+    # 获取用户信息  
+    user_info = await get_weibo_user_info(uid)  
+    if not user_info:  
+        await bot.finish(ev, f'未查询到微博ID为{uid}的用户,请检查ID是否正确~')  
+      
+    # 获取最新5条微博  
+    posts = await get_weibo_user_latest_posts(uid, count=5)  
+    if not posts:  
+        await bot.finish(ev, f'{user_info["name"]} 暂无微博内容~')  
+      
+    # 组装消息  
+    msg_parts = [f'📱 {user_info["name"]} (ID: {uid}) 的最新{len(posts)}条微博:\n\n']  
+      
+    for i, post in enumerate(posts, 1):  
+        msg_parts.append(f'【{i}】{post["text"][:100]}...\n' if len(post["text"]) > 100 else f'【{i}】{post["text"]}\n')  
+          
+        # 添加图片  
+        for pic_url in post['pics'][:3]:  # 每条最多显示3张图  
+            if pic_url:  
+                msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')  
+          
+        msg_parts.append(f'\n👍 {post["attitudes_count"]}  🔁 {post["reposts_count"]}  💬 {post["comments_count"]}')  
+        msg_parts.append(f'\n发布时间: {post["created_at"]}')  
+        msg_parts.append(f'\n链接: https://m.weibo.cn/status/{post["id"]}\n\n')  
+      
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)  
+    await bot.send(ev, ''.join(msg_parts))
+
 @sv.on_prefix(('更新cookie',))
 async def update_cookie(bot, ev: CQEvent):
     # 仅允许管理员操作
