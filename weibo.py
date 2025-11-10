@@ -258,46 +258,60 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     sv.logger.error(f"微博{uid}获取失败（已达最大重试次数），返回空列表")  
     return []
 
-
-async def check_and_push_new_weibo():
-    """检查新微博并推送"""
-    sv.logger.info("开始检查微博更新...")
-    all_followed_uids = set()
-    # 收集所有已关注的微博ID
-    for follows in weibo_config['group_follows'].values():
-        all_followed_uids.update(follows.keys())
-    
-    for uid in all_followed_uids:
-        try:
-            latest_posts = await get_weibo_user_latest_posts(uid)
-            if not latest_posts or not isinstance(latest_posts, list): 
-                sv.logger.warning(f"微博{uid}返回数据异常: {type(latest_posts)}")  
-                continue
-            
-            # 按ID倒序，取最新一条
-            latest_post = max(latest_posts, key=lambda x: x.get('id', ''))
-            latest_post_id = latest_post['id']
-            
-            # 筛选需要推送的群（已开启推送+未推送过该条）
-            groups_to_push = []
-            for group_id, follows in weibo_config['group_follows'].items():
-                if (uid in follows and 
-                    weibo_config['group_enable'].get(group_id, True) and 
-                    latest_post_id > follows[uid]['last_post_id']):
-                    groups_to_push.append(group_id)
-                    weibo_config['group_follows'][group_id][uid]['last_post_id'] = latest_post_id
-            
-            # 推送并保存配置
-            if groups_to_push:
-                save_config()
-                user_info = await get_weibo_user_info(uid)
-                user_name = user_info['name'] if user_info else f'用户{uid}'
-                await push_weibo_to_groups(groups_to_push, user_name, uid, latest_post)
-        
-        except Exception as e:
-            sv.logger.error(f"处理微博{uid}时出错: {e}")
-            continue
-    
+async def check_and_push_new_weibo():  
+    """检查新微博并推送"""  
+    sv.logger.info("开始检查微博更新...")  
+    all_followed_uids = set()  
+    # 收集所有已关注的微博ID  
+    for follows in weibo_config['group_follows'].values():  
+        all_followed_uids.update(follows.keys())  
+      
+    for uid in all_followed_uids:  
+        try:  
+            latest_posts = await get_weibo_user_latest_posts(uid)  
+            if not latest_posts:  
+                continue  
+              
+            # 获取该用户在各群的最早 last_post_id(用于筛选新微博)  
+            min_last_post_id = ''  
+            for group_id, follows in weibo_config['group_follows'].items():  
+                if uid in follows:  
+                    current_id = follows[uid]['last_post_id']  
+                    if not min_last_post_id or current_id < min_last_post_id:  
+                        min_last_post_id = current_id  
+              
+            # 筛选出所有新微博  
+            new_posts = [post for post in latest_posts if post['id'] > min_last_post_id]  
+              
+            if not new_posts:  
+                continue  
+              
+            # 按ID排序(从旧到新)  
+            new_posts.sort(key=lambda x: x['id'])  
+              
+            # 推送每一条新微博  
+            for post in new_posts:  
+                groups_to_push = []  
+                for group_id, follows in weibo_config['group_follows'].items():  
+                    if (uid in follows and   
+                        weibo_config['group_enable'].get(group_id, True) and   
+                        post['id'] > follows[uid]['last_post_id']):  
+                        groups_to_push.append(group_id)  
+                  
+                if groups_to_push:  
+                    user_info = await get_weibo_user_info(uid)  
+                    user_name = user_info['name'] if user_info else f'用户{uid}'  
+                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)  
+                      
+                    # 更新每个群的last_post_id  
+                    for group_id in groups_to_push:  
+                        weibo_config['group_follows'][group_id][uid]['last_post_id'] = post['id']  
+                    save_config()  
+          
+        except Exception as e:  
+            sv.logger.error(f"处理微博{uid}时出错: {e}")  
+            continue  
+      
     sv.logger.info("微博更新检查完成")
 
 
