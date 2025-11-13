@@ -670,8 +670,6 @@ async def update_cookie(bot, ev: CQEvent):
             'xsrf_token': xsrf_token
         }, f, ensure_ascii=False, indent=2)
     
-    await bot.send(ev, '')
-    
     # 测试新配置是否有效
     test_uid = '6220646576'  # 新浪新闻的微博ID，用于测试
     test_result = await get_weibo_user_info(test_uid, retry=1)
