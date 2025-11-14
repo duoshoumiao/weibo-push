@@ -526,6 +526,41 @@ async def unfollow_weibo(bot, ev: CQEvent):
     save_config()
     await bot.send(ev, f'本群已取消关注 {name} 的微博~')
 
+@sv.on_prefix(('全群取消关注微博', '全群取消订阅微博'))  
+async def unfollow_weibo_all_groups(bot, ev: CQEvent):  
+    user_id = ev.user_id  
+      
+    # 仅允许管理员执行全群操作  
+    if not priv.check_priv(ev, priv.ADMIN):  
+        await bot.finish(ev, '只有管理员才能操作全群取消关注哦~')  
+      
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日全群取消关注微博次数已达上限,请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦,请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    uid = ev.message.extract_plain_text().strip()  
+    if not uid:  
+        await bot.finish(ev, '请输入要全群取消关注的微博ID哦~')  
+      
+    # 获取用户信息(用于显示名称)  
+    user_info = await get_weibo_user_info(uid)  
+    user_name = user_info['name'] if user_info else f'用户{uid}'  
+      
+    # 记录取消关注的群数量  
+    unfollow_count = 0  
+      
+    # 遍历所有群的关注列表  
+    for group_id in list(weibo_config['group_follows'].keys()):  
+        if uid in weibo_config['group_follows'][group_id]:  
+            del weibo_config['group_follows'][group_id][uid]  
+            unfollow_count += 1  
+      
+    save_config()  
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)  
+    await bot.send(ev, f'成功为{unfollow_count}个群取消关注 {user_name} 的微博~')
+
 # 查看已关注的微博账号
 @sv.on_fullmatch(('查看关注的微博', '查看订阅的微博'))
 async def list_followed_weibo(bot, ev: CQEvent):
@@ -561,19 +596,20 @@ async def toggle_weibo_push(bot, ev: CQEvent):
         await bot.send(ev, '请输入"微博推送开关 on"开启或"微博推送开关 off"关闭~')
 
 # 帮助信息
-@sv.on_fullmatch(('微博推送帮助', '微博订阅帮助'))
-async def weibo_help(bot, ev: CQEvent):
-    help_msg = '''微博推送插件帮助：
-- 关注微博 [微博ID]：关注指定微博账号（仅本群生效）
-- 全群关注微博 [微博ID]：所有已加入的群都关注并开启推送（管理员）
-- 取消关注微博 [微博ID]：取消关注指定微博账号（仅本群生效）
-- 查看关注的微博：查看本群已关注的微博账号
-- 微博推送开关 [on/off]：开启或关闭本群微博推送（管理员）
-- 微博黑名单 [ID]：将指定微博ID加入本群黑名单（管理员）
-- 微博黑名单移除 [ID]：将指定微博ID从本群黑名单移除（管理员）
-- 查看微博黑名单：查看本群黑名单中的微博ID（管理员）
-- 更新cookie + cookie
-注：微博ID是指微博的数字ID，不是昵称哦~'''
+@sv.on_fullmatch(('微博推送帮助', '微博订阅帮助'))  
+async def weibo_help(bot, ev: CQEvent):  
+    help_msg = '''微博推送插件帮助:  
+- 关注微博 [微博ID]:关注指定微博账号(仅本群生效)  
+- 全群关注微博 [微博ID]:所有已加入的群都关注并开启推送(管理员)  
+- 取消关注微博 [微博ID]:取消关注指定微博账号(仅本群生效)  
+- 全群取消关注微博 [微博ID]:所有已加入的群都取消关注(管理员)  
+- 查看关注的微博:查看本群已关注的微博账号  
+- 微博推送开关 [on/off]:开启或关闭本群微博推送(管理员)  
+- 微博黑名单 [ID]:将指定微博ID加入本群黑名单(管理员)  
+- 微博黑名单移除 [ID]:将指定微博ID从本群黑名单移除(管理员)  
+- 查看微博黑名单:查看本群黑名单中的微博ID(管理员)  
+- 更新cookie + cookie  
+注:微博ID是指微博的数字ID,不是昵称哦~'''  
     await bot.send(ev, help_msg)
 
 # 查看本群微博黑名单
