@@ -23,6 +23,8 @@ https://m.weibo.cn/ F12查找cookie
 
 查看微博黑名单：查看当前黑名单中的微博ID（管理员）
 
+官方半月刊：查看pcr半月刊
+
 更新cookie + cookie  浏览器F12 搜TOKEN
 
  <img width="463" height="260" alt="image" src="https://github.com/user-attachments/assets/09840b95-e092-4ad8-87eb-094447d75221" />
