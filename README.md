@@ -1,7 +1,7 @@
 # weibo-push
 支持hoshino v1
 
-自行提取cookie填入80-81
+https://m.weibo.cn/ F12查找cookie
 
 微博关注小插件
 
