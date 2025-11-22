@@ -355,7 +355,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
 
 
 # -------------------------- 定时任务（调整为10分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=10)
+@sv.scheduled_job('interval', minutes=5)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
