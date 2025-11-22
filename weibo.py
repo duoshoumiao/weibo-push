@@ -618,6 +618,7 @@ async def weibo_help(bot, ev: CQEvent):
 - 微博黑名单 [ID]:将指定微博ID加入本群黑名单(管理员)  
 - 微博黑名单移除 [ID]:将指定微博ID从本群黑名单移除(管理员)  
 - 查看微博黑名单:查看本群黑名单中的微博ID(管理员)  
+- 官方半月刊：查看PCR半月刊
 - 更新cookie + cookie  
 注:微博ID是指微博的数字ID,不是昵称哦~'''  
     await bot.send(ev, help_msg)
@@ -678,6 +679,60 @@ async def view_weibo(bot, ev: CQEvent):
         msg_parts.append(f'\n👍 {post["attitudes_count"]}  🔁 {post["reposts_count"]}  💬 {post["comments_count"]}')  
         msg_parts.append(f'\n发布时间: {post["created_at"]}')  
         msg_parts.append(f'\n链接: https://m.weibo.cn/status/{post["id"]}\n\n')  
+      
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)  
+    await bot.send(ev, ''.join(msg_parts))
+
+@sv.on_fullmatch(('官方半月刊', '查看官方半月刊'))  
+async def get_official_biweekly(bot, ev: CQEvent):  
+    user_id = ev.user_id  
+      
+    # 频率限制  
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日查询次数已达上限,请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦,请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    uid = '6603867494'  # 官方账号ID  
+      
+    # 获取用户信息  
+    user_info = await get_weibo_user_info(uid)  
+    if not user_info:  
+        await bot.finish(ev, '获取官方账号信息失败~')  
+      
+    # 获取最新20条微博(增加数量以提高找到半月刊的概率)  
+    posts = await get_weibo_user_latest_posts(uid, count=20)  
+    if not posts:  
+        await bot.finish(ev, '暂时无法获取微博内容~')  
+      
+    # 查找包含"活动半月刊"的微博  
+    biweekly_post = None  
+    for post in posts:  
+        if '活动半月刊' in post['text']:  
+            biweekly_post = post  
+            break  
+      
+    if not biweekly_post:  
+        await bot.finish(ev, '未找到最新的活动半月刊微博~')  
+      
+    # 组装消息  
+    msg_parts = [  
+        f"📢 {user_info['name']} 最新活动半月刊：\n\n",  
+        f"{biweekly_post['text']}\n\n"  
+    ]  
+      
+    # 添加图片  
+    for pic_url in biweekly_post['pics']:  
+        if pic_url:  
+            msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+      
+    # 添加统计和链接  
+    msg_parts.extend([  
+        f"\n👍 {biweekly_post['attitudes_count']}  🔁 {biweekly_post['reposts_count']}  💬 {biweekly_post['comments_count']}",  
+        f"\n发布时间：{biweekly_post['created_at']}",  
+        f"\n原文链接：https://m.weibo.cn/status/{biweekly_post['id']}"  
+    ])  
       
     _nlmt.increase(user_id)  
     flmt.start_cd(user_id)  
