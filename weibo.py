@@ -702,7 +702,7 @@ async def get_official_biweekly(bot, ev: CQEvent):
         await bot.finish(ev, '获取官方账号信息失败~')  
       
     # 获取最新20条微博(增加数量以提高找到半月刊的概率)  
-    posts = await get_weibo_user_latest_posts(uid, count=20)  
+    posts = await get_weibo_user_latest_posts(uid, count=70)  
     if not posts:  
         await bot.finish(ev, '暂时无法获取微博内容~')  
       
