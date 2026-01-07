@@ -176,7 +176,7 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                                 f"Content-Type: {resp.headers.get('Content-Type', 'N/A')}, "    
                                 f"响应内容前500字符: {full_text[:500]}"    
                             )    
-                            await asyncio.sleep(3)  
+                            await asyncio.sleep(10)  
                             continue    
                             
                         data = await resp.json()    
@@ -363,7 +363,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
 
 
 # -------------------------- 定时任务（调整为10分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=5)
+@sv.scheduled_job('interval', minutes=10)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
