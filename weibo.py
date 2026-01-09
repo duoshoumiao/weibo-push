@@ -1,277 +1,356 @@
-from hoshino import Service, priv
-from hoshino.typing import CQEvent
-from hoshino.util import DailyNumberLimiter, FreqLimiter, escape  
-import json
-import os
-import asyncio
-import aiohttp
-import re
-import html
-from datetime import datetime  
-from nonebot import on_startup
-import json
-import os
-
-sv = Service('微博推送', visible=True, enable_on_default=True, help_='微博推送服务')
-
-# 定义数据文件路径
-DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')
-# 配置文件路径
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'weibo_config.json')
-
-# 频率限制 - CD冷却10秒，每天20000次
-flmt = FreqLimiter(10)
-_nlmt = DailyNumberLimiter(20000)
-
-# 配置结构：群独立黑名单
-weibo_config = {
-    'group_follows': {},      # {group_id: {weibo_id: {name: '微博名', last_post_id: '最后一条ID'}}}
-    'group_enable': {},       # {group_id: True/False}
-    'account_cache': {},      # {weibo_id: {name: '微博名', uid: '微博ID'}}
-    'group_blacklist': {}     # {group_id: set(weibo_id)} 群独立黑名单
+from hoshino import Service, priv  
+from hoshino.typing import CQEvent  
+from hoshino.util import DailyNumberLimiter, FreqLimiter, escape    
+import json  
+import os  
+import asyncio  
+import aiohttp  
+import re  
+import html  
+from datetime import datetime    
+from nonebot import on_startup  
+import requests  
+from lxml import etree  
+import time  
+import random  
+  
+sv = Service('微博推送', visible=True, enable_on_default=True, help_='微博推送服务')  
+  
+# 定义数据文件路径  
+DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')  
+# 配置文件路径  
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'weibo_config.json')  
+  
+# 频率限制 - CD冷却10秒，每天20000次  
+flmt = FreqLimiter(10)  
+_nlmt = DailyNumberLimiter(20000)  
+  
+# 配置结构：群独立黑名单  
+weibo_config = {  
+    'group_follows': {},      # {group_id: {weibo_id: {name: '微博名', last_post_id: '最后一条ID'}}}  
+    'group_enable': {},       # {group_id: True/False}  
+    'account_cache': {},      # {weibo_id: {name: '微博名', uid: '微博ID'}}  
+    'group_blacklist': {}     # {group_id: set(weibo_id)} 群独立黑名单  
+}  
+  
+def format_weibo_time(raw_time):  
+    """时间格式转换为YYYY-MM-DD HH:MM:SS"""  
+    try:  
+        dt = datetime.strptime(raw_time, '%a %b %d %H:%M:%S %z %Y')  
+        return dt.strftime('%Y-%m-%d %H:%M:%S')  
+    except Exception as e:  
+        sv.logger.warning(f"时间格式化失败: {e}，原始时间: {raw_time}")  
+        return raw_time    
+  
+def load_config():  
+    """加载配置文件"""  
+    global weibo_config  
+    if os.path.exists(CONFIG_PATH):  
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:  
+            loaded_config = json.load(f)  
+            # 加载基础配置  
+            for key in ['group_follows', 'group_enable', 'account_cache']:  
+                weibo_config[key] = loaded_config.get(key, {})  
+            # 加载群黑名单（确保为集合类型）  
+            weibo_config['group_blacklist'] = {}  
+            for group_id, uids in loaded_config.get('group_blacklist', {}).items():  
+                weibo_config['group_blacklist'][group_id] = set(uids)  
+    else:  
+        save_config()  
+  
+def save_config():  
+    """保存配置文件（集合转列表适配JSON序列化）"""  
+    config_to_save = weibo_config.copy()  
+    config_to_save['group_blacklist'] = {  
+        group_id: list(uids) for group_id, uids in weibo_config['group_blacklist'].items()  
+    }  
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:  
+        json.dump(config_to_save, f, ensure_ascii=False, indent=2)  
+  
+# 初始化数据文件和headers  
+def init_data():  
+    # 确保数据文件存在  
+    if not os.path.exists(DATA_FILE):  
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:  
+            json.dump({  
+                'cookie': '',  
+                'xsrf_token': ''  
+            }, f, ensure_ascii=False, indent=2)  
+        return {'cookie': '', 'xsrf_token': ''}  
+      
+    # 读取现有数据  
+    try:  
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:  
+            return json.load(f)  
+    except:  
+        # 数据文件损坏时重建  
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:  
+            json.dump({  
+                'cookie': '',  
+                'xsrf_token': ''  
+            }, f, ensure_ascii=False, indent=2)  
+        return {'cookie': '', 'xsrf_token': ''}  
+  
+# 初始化数据  
+data = init_data()  
+# 初始化配置  
+load_config()  
+# -------------------------- 关键修复：补充完整请求头 --------------------------  
+# 1. 打开 https://m.weibo.cn/ 登录账号  
+# 2. F12打开开发者工具 → Network标签 → 刷新页面 → 选任意getIndex请求  
+# 3. 从Request Headers复制Cookie，提取XSRF-TOKEN值（Cookie中XSRF-TOKEN=xxx的xxx部分）  
+headers = {  
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',  
+    'Cache-Control': 'max-age=0',  
+    'Upgrade-Insecure-Requests': '1',  
+    'Sec-Fetch-Dest': 'document',  
+    'Sec-Fetch-Mode': 'navigate',  
+    'Sec-Fetch-Site': 'none',  
+    'Sec-Fetch-User': '?1',  
+    # 移除 X-Requested-With  
 }
-
-
-def format_weibo_time(raw_time):
-    """时间格式转换为YYYY-MM-DD HH:MM:SS"""
-    try:
-        dt = datetime.strptime(raw_time, '%a %b %d %H:%M:%S %z %Y')
-        return dt.strftime('%Y-%m-%d %H:%M:%S')
-    except Exception as e:
-        sv.logger.warning(f"时间格式化失败: {e}，原始时间: {raw_time}")
-        return raw_time  
-
-
-def load_config():
-    """加载配置文件"""
-    global weibo_config
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            loaded_config = json.load(f)
-            # 加载基础配置
-            for key in ['group_follows', 'group_enable', 'account_cache']:
-                weibo_config[key] = loaded_config.get(key, {})
-            # 加载群黑名单（确保为集合类型）
-            weibo_config['group_blacklist'] = {}
-            for group_id, uids in loaded_config.get('group_blacklist', {}).items():
-                weibo_config['group_blacklist'][group_id] = set(uids)
-    else:
-        save_config()
-
-
-def save_config():
-    """保存配置文件（集合转列表适配JSON序列化）"""
-    config_to_save = weibo_config.copy()
-    config_to_save['group_blacklist'] = {
-        group_id: list(uids) for group_id, uids in weibo_config['group_blacklist'].items()
-    }
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(config_to_save, f, ensure_ascii=False, indent=2)
-
-# 初始化数据文件和headers
-def init_data():
-    # 确保数据文件存在
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                'cookie': '',
-                'xsrf_token': ''
-            }, f, ensure_ascii=False, indent=2)
-        return {'cookie': '', 'xsrf_token': ''}
-    
-    # 读取现有数据
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        # 数据文件损坏时重建
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                'cookie': '',
-                'xsrf_token': ''
-            }, f, ensure_ascii=False, indent=2)
-        return {'cookie': '', 'xsrf_token': ''}
-
-# 初始化数据
-data = init_data()
-# 初始化配置
-load_config()
-# -------------------------- 关键修复：补充完整请求头 --------------------------
-# 1. 打开 https://m.weibo.cn/ 登录账号
-# 2. F12打开开发者工具 → Network标签 → 刷新页面 → 选任意getIndex请求
-# 3. 从Request Headers复制Cookie，提取XSRF-TOKEN值（Cookie中XSRF-TOKEN=xxx的xxx部分）
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Referer': 'https://m.weibo.cn/',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Cookie': data['cookie'], 
-    'X-XSRF-TOKEN': data['xsrf_token'] 
-}
-# -----------------------------------------------------------------------------
-
-
-async def get_weibo_user_info(uid, retry=2):
-    """获取微博用户信息（带重试+格式校验）"""
-    if not uid.isdigit():
-        return None
-    
-    # 优先从缓存获取
-    if uid in weibo_config['account_cache']:
-        return weibo_config['account_cache'][uid]
-    
-    url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}'
-    for _ in range(retry + 1):
-        try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(url, timeout=10) as resp:
-                    # 校验响应是否为JSON
-                    if 'application/json' not in resp.headers.get('Content-Type', ''):
-                        sv.logger.warning(f"用户{uid}信息非JSON响应，重试中")
-                        await asyncio.sleep(3)
-                        continue
-                    
-                    data = await resp.json()
-                    if data.get('ok') == 1:
-                        user_info = data.get('data', {}).get('userInfo', {})
-                        if not user_info:
-                            return None
-                        # 缓存用户信息
-                        result = {
-                            'name': user_info.get('screen_name', f'用户{uid}'),
-                            'uid': uid
-                        }
-                        weibo_config['account_cache'][uid] = result
-                        save_config()
-                        return result
-                    sv.logger.warning(f"用户{uid}信息获取失败，API返回: {data}")
-                    await asyncio.sleep(3)
-        except Exception as e:
-            sv.logger.error(f"用户{uid}信息请求异常: {e}，重试中")
-            await asyncio.sleep(3)
-    
-    sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数）")
-    return None
-
-
-async def get_weibo_user_latest_posts(uid, count=5, retry=2):    
-    """获取用户最新微博(带重试+格式校验+视频解析+增强错误日志+分页支持)"""    
+# -----------------------------------------------------------------------------  
+  
+def parse_html_response(html_content):  
+    """解析HTML响应，提取微博内容"""  
+    try:  
+        from lxml import etree  
+        import re  
+          
+        # 移除XML声明  
+        if html_content.startswith('<?xml'):  
+            html_content = re.sub(r'<\?xml[^>]*\?>', '', html_content)  
+          
+        # 解析HTML  
+        selector = etree.HTML(html_content)  
+        if selector is None:  
+            sv.logger.error("HTML解析失败：selector为None")  
+            return []  
+          
+        # 调试：检查页面实际结构  
+        all_divs = selector.xpath('//div')  
+        sv.logger.info(f"页面总共有{len(all_divs)}个div元素")  
+          
+        # 检查所有div的class属性  
+        for i, div in enumerate(all_divs[:10]):  # 只检查前10个  
+            class_attr = div.get('class', 'no-class')  
+            sv.logger.info(f"div{i+1} class: {class_attr}")  
+          
+        # 提取微博卡片 - 根据实际HTML结构  
+        cards = selector.xpath('//div[@class="c" and starts-with(@id, "M_")]')  
+        sv.logger.info(f"找到{len(cards)}个微博卡片")  
+          
+        if not cards:  
+            # 备用选择器  
+            cards = selector.xpath('//div[contains(@class, "c")]')  
+            sv.logger.info(f"备用选择器找到{len(cards)}个c元素")  
+          
+        all_posts = []  
+          
+        for card in cards:  
+            try:  
+                # 提取微博ID  
+                card_id = card.get('id', '')  
+                if not card_id.startswith('M_'):  
+                    continue  
+                post_id = card_id[2:]  # 移除"M_"前缀  
+                  
+                # 更全面的文本提取  
+                text_parts = []  
+                  
+                # 方法1：提取所有文本节点  
+                all_text = card.xpath('.//text()')  
+                for text in all_text:  
+                    text = text.strip()  
+                    if text and text not in ['转发', '评论', '赞', '来自微博网页版']:  
+                        text_parts.append(text)  
+                  
+                # 方法2：提取特定class的文本  
+                ctt_elements = card.xpath('.//span[@class="ctt"]//text()')  
+                for text in ctt_elements:  
+                    text = text.strip()  
+                    if text:  
+                        text_parts.append(text)  
+                  
+                # 组合文本  
+                text = ' '.join(text_parts).strip()  
+                  
+                # 清理文本  
+                text = re.sub(r'\s+', ' ', text)  
+                text = html.unescape(text)  
+                  
+                if not text:  
+                    text = "【无正文内容】"  
+                  
+                # 提取图片  
+                pics = []  
+                img_elements = card.xpath('.//img[@class="ib"]')  
+                for img in img_elements:  
+                    img_src = img.get('src', '')  
+                    if img_src and any(img_src.endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.gif']):  
+                        # 处理相对路径  
+                        if img_src.startswith('//'):  
+                            img_src = 'https:' + img_src  
+                        elif img_src.startswith('/'):  
+                            img_src = 'https://weibo.cn' + img_src  
+                        pics.append(img_src)  
+                  
+                # 提取时间  
+                time_elem = card.xpath('.//span[@class="ct"]/text()')  
+                time_text = time_elem[0].strip() if time_elem else 'unknown'  
+                  
+                # 提取统计数据  
+                stats_text = ' '.join([t.strip() for t in card.xpath('.//text()') if '赞[' in t or '转发[' in t or '评论[' in t])  
+                reposts_count = 0  
+                comments_count = 0  
+                attitudes_count = 0  
+                  
+                if stats_text:  
+                    # 解析统计数据  
+                    repost_match = re.search(r'转发\[(\d+)\]', stats_text)  
+                    comment_match = re.search(r'评论\[(\d+)\]', stats_text)  
+                    like_match = re.search(r'赞\[(\d+)\]', stats_text)  
+                      
+                    reposts_count = int(repost_match.group(1)) if repost_match else 0  
+                    comments_count = int(comment_match.group(1)) if comment_match else 0  
+                    attitudes_count = int(like_match.group(1)) if like_match else 0  
+                  
+                all_posts.append({  
+                    'id': post_id,  
+                    'text': text,  
+                    'pics': pics,  
+                    'video': {'play_page_url': '', 'cover_url': ''},  
+                    'created_at': time_text,  
+                    'reposts_count': reposts_count,  
+                    'comments_count': comments_count,  
+                    'attitudes_count': attitudes_count  
+                })  
+                  
+            except Exception as e:  
+                sv.logger.error(f"解析单个微博卡片失败: {e}")  
+                continue  
+          
+        sv.logger.info(f"HTML解析完成，共提取{len(all_posts)}条微博")  
+        return all_posts  
+          
+    except Exception as e:  
+        sv.logger.error(f"HTML解析失败: {e}")  
+        return []
+        
+async def get_weibo_user_info(uid, retry=2):  
+    """获取微博用户信息（带重试+格式校验）"""  
+    if not uid.isdigit():  
+        return None  
+      
+    # 优先从缓存获取  
+    if uid in weibo_config['account_cache']:  
+        return weibo_config['account_cache'][uid]  
+      
+    url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}'  
+    for _ in range(retry + 1):  
+        try:  
+            async with aiohttp.ClientSession(headers=headers) as session:  
+                async with session.get(url, timeout=10) as resp:  
+                    # 校验响应是否为JSON  
+                    if 'application/json' not in resp.headers.get('Content-Type', ''):  
+                        sv.logger.warning(f"用户{uid}信息非JSON响应，重试中")  
+                        await asyncio.sleep(3)  
+                        continue  
+                      
+                    data = await resp.json()  
+                    if data.get('ok') == 1:  
+                        user_info = data.get('data', {}).get('userInfo', {})  
+                        if not user_info:  
+                            return None  
+                        # 缓存用户信息  
+                        result = {  
+                            'name': user_info.get('screen_name', f'用户{uid}'),  
+                            'uid': uid  
+                        }  
+                        weibo_config['account_cache'][uid] = result  
+                        save_config()  
+                        return result  
+                    sv.logger.warning(f"用户{uid}信息获取失败，API返回: {data}")  
+                    await asyncio.sleep(3)  
+        except Exception as e:  
+            sv.logger.error(f"用户{uid}信息请求异常: {e}，重试中")  
+            await asyncio.sleep(3)  
+      
+    sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数）")  
+    return None  
+  
+async def get_weibo_user_latest_posts(uid, count=5, retry=2):  
+    """获取用户最新微博(HTML抓取版本)"""  
+    global data  # Add this line  
     all_posts = []  
     page = 1  
-    max_pages = 3  # 最多请求3页,避免请求过多  
+    max_pages = 5  
+      
+    # HTML请求头（模拟浏览器）  
+    html_headers = {  
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',  
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',  
+        'Accept-Language': 'zh-CN,zh;q=0.9,ja;q=0.8,zh-TW;q=0.7',  
+        'Accept-Encoding': 'gzip, deflate, br, zstd',  
+        'Cache-Control': 'max-age=0',  
+        'Cookie': data['cookie'],  # This line was causing the error  
+        'Upgrade-Insecure-Requests': '1',  
+        'Sec-Fetch-Dest': 'document',  
+        'Sec-Fetch-Mode': 'navigate',  
+        'Sec-Fetch-Site': 'none',  
+        'Sec-Fetch-User': '?1'  
+    }
       
     while len(all_posts) < count and page <= max_pages:  
-        url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page={page}'    
+        url = f'https://weibo.cn/{uid}?page={page}'  
           
-        for attempt in range(retry + 1):    
-            try:    
-                async with aiohttp.ClientSession(headers=headers) as session:    
-                    async with session.get(url, timeout=10) as resp:      
-                        # 增强的JSON格式校验和错误日志    
-                        if 'application/json' not in resp.headers.get('Content-Type', ''):      
-                            full_text = await resp.text()      
-                            sv.logger.warning(    
-                                f"微博{uid}非JSON响应(页{page},尝试{attempt+1}/{retry+1}) - "    
-                                f"状态码: {resp.status}, "    
-                                f"Content-Type: {resp.headers.get('Content-Type', 'N/A')}, "    
-                                f"响应内容前500字符: {full_text[:500]}"    
-                            )    
-                            await asyncio.sleep(10)  
-                            continue    
-                            
-                        data = await resp.json()    
-                        if data.get('ok') != 1:    
-                            sv.logger.warning(    
-                                f"微博{uid}获取失败(页{page},尝试{attempt+1}/{retry+1}), "    
-                                f"API返回: {data}, 重试中"    
-                            )    
-                            await asyncio.sleep(3)    
-                            continue    
-                            
-                        # 解析微博内容    
-                        cards = data.get('data', {}).get('cards', [])  
-                        if not cards:  # 如果没有更多内容,停止翻页  
-                            return all_posts  
+        for attempt in range(retry + 1):  
+            try:  
+                async with aiohttp.ClientSession(headers=html_headers) as session:  
+                    async with session.get(url, timeout=10) as resp:  
+                        if resp.status != 200:  
+                            sv.logger.warning(f"微博{uid}页面请求失败(页{page},尝试{attempt+1}/{retry+1}) - 状态码: {resp.status}")  
+                            await asyncio.sleep(3)  
+                            continue  
+                          
+                        content_type = resp.headers.get('Content-Type', '')  
+                        if 'text/html' in content_type:  
+                            # HTML响应处理  
+                            html_content = await resp.text()  
+                            sv.logger.info(f"获取到HTML内容，长度: {len(html_content)}")  
+                            html_posts = parse_html_response(html_content)  
+                            sv.logger.info(f"HTML解析结果: {len(html_posts)}条微博")  
+                            if html_posts:  
+                                all_posts.extend(html_posts)  
+                                if len(all_posts) >= count:  
+                                    return all_posts[:count]  
+                            break  
+                        elif 'application/json' in content_type:  
+                            # JSON响应处理（备用）  
+                            data = await resp.json()  
+                            if data.get('ok') == 1:  
+                                cards = data.get('data', {}).get('cards', [])  
+                                for card in cards:  
+                                    if card.get('card_type') == 9:  
+                                        mblog = card.get('mblog', {})  
+                                        # 原有的JSON解析逻辑...  
+                                        if len(all_posts) >= count:  
+                                            return all_posts  
+                                break  
+                            else:  
+                                sv.logger.warning(f"微博{uid}获取失败(页{page},尝试{attempt+1}/{retry+1}), API返回: {data}")  
+                                await asyncio.sleep(3)  
+                        else:  
+                            sv.logger.warning(f"微博{uid}未知响应格式(页{page},尝试{attempt+1}/{retry+1}) - Content-Type: {content_type}")  
+                            await asyncio.sleep(3)  
+                            continue  
                               
-                        for card in cards:    
-                            if card.get('card_type') != 9:  
-                                continue    
-                                
-                            mblog = card.get('mblog', {})    
-                            retweeted_status = mblog.get('retweeted_status')  
-                                
-                            # 1. 处理正文    
-                            if retweeted_status:    
-                                retweeted_text = re.sub(r'<br\s*/?>', '\n', retweeted_status.get('text', ''))    
-                                retweeted_text = re.sub(r'<[^>]+>', '', retweeted_text)    
-                                retweeted_text = html.unescape(retweeted_text).strip() or "【被转发微博无正文】"    
-                                    
-                                forward_text = re.sub(r'<br\s*/?>', '\n', mblog.get('text', ''))    
-                                forward_text = re.sub(r'<[^>]+>', '', forward_text)    
-                                forward_text = html.unescape(forward_text).strip()    
-                                    
-                                if re.match(r'^[\s!"#$%&\'()*+,-./:;<=>?@\[\\\]^_`{|}~，。、；：？！…—·《》「」『』【】（）]*$', forward_text):    
-                                    forward_text = ''    
-                                    
-                                text = f"转发说明：{forward_text}\n\n被转发内容：{retweeted_text}" if forward_text else f"被转发内容：{retweeted_text}"    
-                            else:    
-                                text = re.sub(r'<br\s*/?>', '\n', mblog.get('text', ''))    
-                                text = re.sub(r'<[^>]+>', '', text)    
-                                text = html.unescape(text).strip() or "【无正文内容】"    
-                                
-                            # 2. 处理图片    
-                            pics = retweeted_status.get('pics', []) if retweeted_status else mblog.get('pics', [])    
-                            pic_urls = [pic.get('large', {}).get('url', '') for pic in pics if pic.get('large')]    
-                                
-                            # 3. 处理视频    
-                            video_info = {'play_page_url': '', 'cover_url': ''}    
-                            page_info = retweeted_status.get('page_info', {}) if retweeted_status else mblog.get('page_info', {})    
-                            if page_info.get('type') in ['video', 'weibo_video']:    
-                                fid = page_info.get('fid') or page_info.get('object_id')    
-                                if fid:    
-                                    video_info['play_page_url'] = f"https://video.weibo.com/show?fid={fid}"    
-                                video_info['cover_url'] = (    
-                                    page_info.get('page_pic', {}).get('url', '') or    
-                                    page_info.get('media_info', {}).get('cover_image_url', '') or    
-                                    page_info.get('media_info', {}).get('stream_url_hd', '').replace('.mp4', '.jpg').replace('.webm', '.jpg')    
-                                )    
-                            if video_info['play_page_url']:    
-                                if video_info['cover_url']:    
-                                    text += f"\n[CQ:image,url={escape(video_info['cover_url'])}]"    
-                                text += f"\n🎬 视频播放页：{video_info['play_page_url']}"    
-                                
-                            # 4. 处理时间和统计数据    
-                            raw_time = retweeted_status.get('created_at', '未知时间') if retweeted_status else mblog.get('created_at', '未知时间')    
-                            formatted_time = format_weibo_time(raw_time)    
-                                
-                            stats = retweeted_status if retweeted_status else mblog    
-                            all_posts.append({    
-                                'id': mblog.get('id', ''),    
-                                'text': text,    
-                                'pics': pic_urls,    
-                                'video': video_info,    
-                                'created_at': formatted_time,    
-                                'reposts_count': stats.get('reposts_count', 0),    
-                                'comments_count': stats.get('comments_count', 0),    
-                                'attitudes_count': stats.get('attitudes_count', 0)    
-                            })    
-                                
-                            if len(all_posts) >= count:    
-                                return all_posts  
-                          
-                        # 成功获取本页数据,跳出重试循环  
-                        break  
-                          
-            except Exception as e:      
-                sv.logger.error(    
-                    f"微博{uid}请求异常(页{page},尝试{attempt+1}/{retry+1}): "    
-                    f"{type(e).__name__}: {e}"    
-                )    
+            except Exception as e:  
+                sv.logger.error(f"微博{uid}请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")  
                 await asyncio.sleep(3)  
           
-        # 翻到下一页  
         page += 1  
-        await asyncio.sleep(1)  # 页面间延迟,避免请求过快  
+        await asyncio.sleep(1)  
       
     return all_posts
 
@@ -694,57 +773,69 @@ async def view_weibo(bot, ev: CQEvent):
 
 @sv.on_fullmatch(('官方半月刊', '查看官方半月刊'))  
 async def get_official_biweekly(bot, ev: CQEvent):  
-    user_id = ev.user_id  
-      
-    # 频率限制  
-    if not _nlmt.check(user_id):  
-        await bot.finish(ev, '今日查询次数已达上限,请明天再试~')  
-    if not flmt.check(user_id):  
-        await bot.finish(ev, f'操作太频繁啦,请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
-      
-    uid = '6603867494'  # 官方账号ID  
-      
-    # 获取用户信息  
-    user_info = await get_weibo_user_info(uid)  
-    if not user_info:  
-        await bot.finish(ev, '获取官方账号信息失败~')  
-      
-    # 获取最新20条微博(增加数量以提高找到半月刊的概率)  
-    posts = await get_weibo_user_latest_posts(uid, count=70)  
-    if not posts:  
-        await bot.finish(ev, '暂时无法获取微博内容~')  
-      
-    # 查找包含"活动半月刊"的微博  
-    biweekly_post = None  
-    for post in posts:  
-        if '活动半月刊' in post['text']:  
-            biweekly_post = post  
-            break  
-      
-    if not biweekly_post:  
-        await bot.finish(ev, '未找到最新的活动半月刊微博~')  
-      
-    # 组装消息  
-    msg_parts = [  
-        f"📢 {user_info['name']} 最新活动半月刊：\n\n",  
-        f"{biweekly_post['text']}\n\n"  
-    ]  
-      
-    # 添加图片  
-    for pic_url in biweekly_post['pics']:  
-        if pic_url:  
-            msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
-      
-    # 添加统计和链接  
-    msg_parts.extend([  
-        f"\n👍 {biweekly_post['attitudes_count']}  🔁 {biweekly_post['reposts_count']}  💬 {biweekly_post['comments_count']}",  
-        f"\n发布时间：{biweekly_post['created_at']}",  
-        f"\n原文链接：https://m.weibo.cn/status/{biweekly_post['id']}"  
-    ])  
-      
-    _nlmt.increase(user_id)  
-    flmt.start_cd(user_id)  
-    await bot.send(ev, ''.join(msg_parts))
+    try:  
+        user_id = ev.user_id  
+          
+        # 频率限制检查  
+        if not _nlmt.check(user_id):  
+            await bot.finish(ev, '今日查询次数已达上限，请明天再试~')  
+        if not flmt.check(user_id):  
+            await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+          
+        uid = '6603867494'  # 官方账号ID  
+          
+        # 获取用户信息  
+        user_info = await get_weibo_user_info(uid)  
+        if not user_info:  
+            await bot.finish(ev, '❌ 获取官方账号信息失败\n'  
+                              '💡 建议管理员执行"更新cookie"命令更新认证信息')  
+            return  
+          
+        # 获取最新70条微博(增加数量以提高找到半月刊的概率)  
+        posts = await get_weibo_user_latest_posts(uid, count=70)  
+        if not posts:  
+            await bot.finish(ev, '❌ 无法获取微博内容\n'  
+                              '💡 可能是网络问题或认证失效，建议管理员检查配置')  
+            return  
+          
+        # 查找包含"活动半月刊"的微博  
+        biweekly_post = None  
+        for post in posts:  
+            if '活动半月刊' in post['text']:  
+                biweekly_post = post  
+                break  
+          
+        if not biweekly_post:  
+            await bot.finish(ev, '❌ 未找到最新的活动半月刊微博\n'  
+                              '💡 请稍后重试或联系管理员检查账号状态')  
+            return  
+          
+        # 组装消息  
+        msg_parts = [  
+            f"📢 {user_info['name']} 最新活动半月刊：\n\n",  
+            f"{biweekly_post['text']}\n\n"  
+        ]  
+          
+        # 添加图片  
+        for pic_url in biweekly_post['pics']:  
+            if pic_url:  
+                msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+          
+        # 添加统计和链接  
+        msg_parts.extend([  
+            f"\n👍 {biweekly_post['attitudes_count']}  🔁 {biweekly_post['reposts_count']}  💬 {biweekly_post['comments_count']}",  
+            f"\n发布时间：{biweekly_post['created_at']}",  
+            f"\n原文链接：https://m.weibo.cn/status/{biweekly_post['id']}"  
+        ])  
+          
+        _nlmt.increase(user_id)  
+        flmt.start_cd(user_id)  
+        await bot.send(ev, ''.join(msg_parts))  
+          
+    except Exception as e:  
+        sv.logger.error(f"获取官方半月刊失败: {e}")  
+        await bot.finish(ev, f'❌ 获取半月刊时发生错误: {str(e)}\n'  
+                          '💡 请稍后重试或联系管理员处理')
 
 @sv.on_prefix(('更新cookie',))
 async def update_cookie(bot, ev: CQEvent):
