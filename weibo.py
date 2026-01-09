@@ -14,7 +14,7 @@ from lxml import etree
 import time  
 import random  
   
-sv = Service('微博推送', visible=True, enable_on_default=True, help_='微博推送服务')  
+sv = Service('微博推送', visible=True, enable_on_default=False, help_='微博推送服务')  
   
 # 定义数据文件路径  
 DATA_FILE = os.path.join(os.path.dirname(__file__), 'data.json')  
@@ -127,124 +127,110 @@ def parse_html_response(html_content):
             sv.logger.error("HTML解析失败：selector为None")  
             return []  
           
-        # 调试：检查页面实际结构  
-        all_divs = selector.xpath('//div')  
-        sv.logger.info(f"页面总共有{len(all_divs)}个div元素")  
-          
-        # 检查所有div的class属性  
-        for i, div in enumerate(all_divs[:10]):  # 只检查前10个  
-            class_attr = div.get('class', 'no-class')  
-            sv.logger.info(f"div{i+1} class: {class_attr}")  
-          
-        # 提取微博卡片 - 根据实际HTML结构  
+        # 查找所有微博卡片  
         cards = selector.xpath('//div[@class="c" and starts-with(@id, "M_")]')  
-        sv.logger.info(f"找到{len(cards)}个微博卡片")  
-          
-        if not cards:  
-            # 备用选择器  
-            cards = selector.xpath('//div[contains(@class, "c")]')  
-            sv.logger.info(f"备用选择器找到{len(cards)}个c元素")  
-          
         all_posts = []  
           
         for card in cards:  
             try:  
                 # 提取微博ID  
                 card_id = card.get('id', '')  
-                if not card_id.startswith('M_'):  
-                    continue  
-                post_id = card_id[2:]  # 移除"M_"前缀  
+                post_id = card_id.replace('M_', '') if card_id else 'unknown'  
                   
-                # 更全面的文本提取  
+                # 提取文本内容  
                 text_parts = []  
+                text_nodes = card.xpath('.//span[@class="ctt"]/text()')  
+                for node in text_nodes:  
+                    if node and node.strip():  
+                        text_parts.append(node.strip())  
                   
-                # 方法1：提取所有文本节点  
-                all_text = card.xpath('.//text()')  
-                for text in all_text:  
-                    text = text.strip()  
-                    if text and text not in ['转发', '评论', '赞', '来自微博网页版']:  
-                        text_parts.append(text)  
+                # 如果没有找到ctt，尝试其他文本节点  
+                if not text_parts:  
+                    all_text = card.xpath('.//text()')  
+                    for text in all_text:  
+                        text = text.strip()  
+                        if text and not any(x in text for x in ['转发', '评论', '赞', '来自', '原文链接']):  
+                            text_parts.append(text)  
                   
-                # 方法2：提取特定class的文本  
-                ctt_elements = card.xpath('.//span[@class="ctt"]//text()')  
-                for text in ctt_elements:  
-                    text = text.strip()  
-                    if text:  
-                        text_parts.append(text)  
+                text = ' '.join(text_parts) if text_parts else "【无正文内容】"  
                   
-                # 组合文本  
-                text = ' '.join(text_parts).strip()  
+                # 改进的图片提取  
+                pic_urls = []  
                   
-                # 清理文本  
-                text = re.sub(r'\s+', ' ', text)  
-                text = html.unescape(text)  
-                  
-                if not text:  
-                    text = "【无正文内容】"  
-                  
-                # 提取图片  
-                pics = []  
-                img_elements = card.xpath('.//img[@class="ib"]')  
-                for img in img_elements:  
-                    img_src = img.get('src', '')  
-                    if img_src and any(img_src.endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.gif']):  
+                # 方法1：查找所有img标签  
+                all_imgs = card.xpath('.//img')  
+                for img in all_imgs:  
+                    src = img.get('src', '')  
+                    if src and any(x in src.lower() for x in ['.jpg', '.jpeg', '.png', '.gif']):  
+                        # 转换为原图URL  
+                        if 'thumb' in src or 'thumbnail' in src:  
+                            # 移除缩略图标识  
+                            original_url = src.replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
+                        else:  
+                            original_url = src  
+                          
                         # 处理相对路径  
-                        if img_src.startswith('//'):  
-                            img_src = 'https:' + img_src  
-                        elif img_src.startswith('/'):  
-                            img_src = 'https://weibo.cn' + img_src  
-                        pics.append(img_src)  
+                        if original_url.startswith('//'):  
+                            original_url = 'https:' + original_url  
+                        elif original_url.startswith('/'):  
+                            original_url = 'https://weibo.cn' + original_url  
+                          
+                        if original_url not in pic_urls:  
+                            pic_urls.append(original_url)  
+                  
+                # 方法2：从链接中提取图片URL  
+                links = card.xpath('.//a[contains(@href, "photo")]')  
+                for link in links:  
+                    href = link.get('href', '')  
+                    if 'photo' in href and 'weibo.cn' in href:  
+                        if href not in pic_urls:  
+                            pic_urls.append(href)  
                   
                 # 提取时间  
-                time_elem = card.xpath('.//span[@class="ct"]/text()')  
-                time_text = time_elem[0].strip() if time_elem else 'unknown'  
-                  
-                # 提取统计数据  
-                stats_text = ' '.join([t.strip() for t in card.xpath('.//text()') if '赞[' in t or '转发[' in t or '评论[' in t])  
-                reposts_count = 0  
-                comments_count = 0  
-                attitudes_count = 0  
-                  
-                if stats_text:  
-                    # 解析统计数据  
-                    repost_match = re.search(r'转发\[(\d+)\]', stats_text)  
-                    comment_match = re.search(r'评论\[(\d+)\]', stats_text)  
-                    like_match = re.search(r'赞\[(\d+)\]', stats_text)  
-                      
-                    reposts_count = int(repost_match.group(1)) if repost_match else 0  
-                    comments_count = int(comment_match.group(1)) if comment_match else 0  
-                    attitudes_count = int(like_match.group(1)) if like_match else 0  
+                time_elem = card.xpath('.//span[@class="ct"]')  
+                time_text = time_elem[0].text if time_elem else 'unknown'  
                   
                 all_posts.append({  
                     'id': post_id,  
                     'text': text,  
-                    'pics': pics,  
+                    'pics': pic_urls,  
                     'video': {'play_page_url': '', 'cover_url': ''},  
                     'created_at': time_text,  
-                    'reposts_count': reposts_count,  
-                    'comments_count': comments_count,  
-                    'attitudes_count': attitudes_count  
+                    'reposts_count': 0,  
+                    'comments_count': 0,  
+                    'attitudes_count': 0  
                 })  
                   
             except Exception as e:  
                 sv.logger.error(f"解析单个微博卡片失败: {e}")  
                 continue  
           
-        sv.logger.info(f"HTML解析完成，共提取{len(all_posts)}条微博")  
         return all_posts  
           
     except Exception as e:  
         sv.logger.error(f"HTML解析失败: {e}")  
         return []
         
-async def get_weibo_user_info(uid, retry=2):  
-    """获取微博用户信息（带重试+格式校验）"""  
+async def get_weibo_user_info(uid, retry=2, force_refresh=False):  
+    """获取微博用户信息（带重试+格式校验+强制刷新）"""  
     if not uid.isdigit():  
         return None  
       
+    # 强制刷新时清除缓存  
+    if force_refresh and uid in weibo_config['account_cache']:  
+        del weibo_config['account_cache'][uid]  
+        save_config()  
+      
     # 优先从缓存获取  
     if uid in weibo_config['account_cache']:  
-        return weibo_config['account_cache'][uid]  
+        cached_info = weibo_config['account_cache'][uid]  
+        # 验证缓存的UID是否匹配  
+        if cached_info.get('uid') == uid:  
+            return cached_info  
+        else:  
+            # 缓存不匹配，清除并重新获取  
+            del weibo_config['account_cache'][uid]  
+            save_config()  
       
     url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}'  
     for _ in range(retry + 1):  
@@ -277,8 +263,8 @@ async def get_weibo_user_info(uid, retry=2):
             await asyncio.sleep(3)  
       
     sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数）")  
-    return None  
-  
+    return None
+    
 async def get_weibo_user_latest_posts(uid, count=5, retry=2):  
     """获取用户最新微博(HTML抓取版本)"""  
     global data  # Add this line  
@@ -355,94 +341,113 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     return all_posts
 
 
-async def check_and_push_new_weibo():  
-    """检查新微博并推送"""  
-    sv.logger.info("开始检查微博更新...")  
-    all_followed_uids = set()  
-    # 收集所有已关注的微博ID  
-    for follows in weibo_config['group_follows'].values():  
-        all_followed_uids.update(follows.keys())  
-      
-    for uid in all_followed_uids:  
-        try:  
-            latest_posts = await get_weibo_user_latest_posts(uid)  
-            if not latest_posts:  
-                continue  
-              
-            # 获取该用户在各群的最早 last_post_id(用于筛选新微博)  
-            min_last_post_id = ''  
-            for group_id, follows in weibo_config['group_follows'].items():  
-                if uid in follows:  
-                    current_id = follows[uid]['last_post_id']  
-                    if not min_last_post_id or current_id < min_last_post_id:  
-                        min_last_post_id = current_id  
-              
-            # 筛选出所有新微博  
-            new_posts = [post for post in latest_posts if post['id'] > min_last_post_id]  
-              
-            if not new_posts:  
-                continue  
-              
-            # 按ID排序(从旧到新)  
-            new_posts.sort(key=lambda x: x['id'])  
-              
-            # 推送每一条新微博  
-            for post in new_posts:  
-                groups_to_push = []  
-                for group_id, follows in weibo_config['group_follows'].items():  
-                    if (uid in follows and   
-                        weibo_config['group_enable'].get(group_id, True) and   
-                        post['id'] > follows[uid]['last_post_id']):  
-                        groups_to_push.append(group_id)  
-                  
-                if groups_to_push:  
-                    user_info = await get_weibo_user_info(uid)  
-                    user_name = user_info['name'] if user_info else f'用户{uid}'  
-                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)  
+async def check_and_push_new_weibo():    
+    """检查新微博并推送"""    
+    sv.logger.info("开始检查微博更新...")    
+    all_followed_uids = set()    
+    # 收集所有已关注的微博ID    
+    for follows in weibo_config['group_follows'].values():    
+        all_followed_uids.update(follows.keys())    
+        
+    for uid in all_followed_uids:    
+        try:    
+            latest_posts = await get_weibo_user_latest_posts(uid)    
+            if not latest_posts:    
+                continue    
+                
+            # 获取该用户在各群的最早 last_post_id(用于筛选新微博)    
+            min_last_post_id = ''    
+            for group_id, follows in weibo_config['group_follows'].items():    
+                if uid in follows:    
+                    current_id = follows[uid]['last_post_id']    
+                    if not min_last_post_id or current_id < min_last_post_id:    
+                        min_last_post_id = current_id    
+                
+            # 筛选出所有新微博    
+            new_posts = [post for post in latest_posts if post['id'] > min_last_post_id]    
+                
+            if not new_posts:    
+                continue    
+                
+            # 按ID排序(从旧到新)    
+            new_posts.sort(key=lambda x: x['id'])    
+                
+            # 推送每一条新微博    
+            for post in new_posts:    
+                groups_to_push = []    
+                for group_id, follows in weibo_config['group_follows'].items():    
+                    if (uid in follows and     
+                        weibo_config['group_enable'].get(group_id, True) and     
+                        post['id'] > follows[uid]['last_post_id']):    
+                        groups_to_push.append(group_id)    
+                    
+                if groups_to_push:    
+                    # 关键修复：强制刷新用户信息确保准确性  
+                    user_info = await get_weibo_user_info(uid, force_refresh=True)    
+                    user_name = user_info['name'] if user_info else f'用户{uid}'    
                       
-                    # 更新每个群的last_post_id  
-                    for group_id in groups_to_push:  
-                        weibo_config['group_follows'][group_id][uid]['last_post_id'] = post['id']  
-                    save_config()  
-          
-        except Exception as e:  
-            sv.logger.error(f"处理微博{uid}时出错: {e}")  
-            continue  
+                    # 验证UID匹配  
+                    if user_info and user_info.get('uid') != uid:  
+                        sv.logger.warning(f"用户信息不匹配: 请求UID={uid}, 返回UID={user_info.get('uid')}")  
+                        # 如果不匹配，重新获取一次  
+                        user_info = await get_weibo_user_info(uid, force_refresh=True)  
+                        user_name = user_info['name'] if user_info else f'用户{uid}'  
+                      
+                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)    
+                        
+                    # 更新每个群的last_post_id    
+                    for group_id in groups_to_push:    
+                        weibo_config['group_follows'][group_id][uid]['last_post_id'] = post['id']    
+                    save_config()    
+            
+        except Exception as e:    
+            sv.logger.error(f"处理微博{uid}时出错: {e}")    
+            continue    
+        
+
+
+async def push_weibo_to_groups(group_ids, name, uid, post):  
+    """推送微博到指定群（带用户信息验证）"""  
+    # 验证用户信息是否匹配  
+    if uid != '6603867494':  # 如果不是公主连结官方账号  
+        # 重新获取用户信息以确保准确性  
+        fresh_user_info = await get_weibo_user_info(uid, force_refresh=True)  
+        if fresh_user_info and fresh_user_info['name'] != name:  
+            sv.logger.warning(f"用户名不匹配: 缓存={name}, 实际={fresh_user_info['name']}, UID={uid}")  
+            name = fresh_user_info['name']  
       
-    sv.logger.info("微博更新检查完成")
-
-
-async def push_weibo_to_groups(group_ids, name, uid, post):
-    """推送微博到指定群"""
-    # 组装消息
-    msg_parts = [
-        f"📢 {name} (ID: {uid}) 发布新微博：\n",
-        f"{post['text']}\n\n"
-    ]
-    # 追加图片
-    for pic_url in post['pics']:
-        if pic_url:
-            msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
-    # 追加统计和链接
-    msg_parts.extend([
-        f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}",
-        f"\n发布时间：{post['created_at']}",
-        f"\n原文链接：https://m.weibo.cn/status/{post['id']}",
-        f"\n取消关注请使用：取消关注微博 {uid}"
-    ])
-    full_msg = ''.join(msg_parts)
-    
-    # 发送到每个群（避免发送过快）
-    for group_id in group_ids:
-        try:
-            await sv.bot.send_group_msg(group_id=int(group_id), message=full_msg)
-            await asyncio.sleep(3)
-        except Exception as e:
+    # 组装消息  
+    msg_parts = [  
+        f"📢 {name} (ID: {uid}) 发布新微博：\n",  
+        f"{post['text']}\n\n"  
+    ]  
+      
+    # 追加图片  
+    for pic_url in post['pics']:  
+        if pic_url:  
+            msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+      
+    # 追加统计和链接  
+    msg_parts.extend([  
+        f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}",  
+        f"\n发布时间：{post['created_at']}",  
+        f"\n原文链接：https://m.weibo.cn/status/{post['id']}",  
+        f"\n取消关注请使用：取消关注微博 {uid}"  
+    ])  
+      
+    full_msg = ''.join(msg_parts)  
+      
+    # 发送到每个群（避免发送过快）  
+    for group_id in group_ids:  
+        try:  
+            await sv.bot.send_group_msg(group_id=int(group_id), message=full_msg)  
+            await asyncio.sleep(3)  
+        except Exception as e:  
             sv.logger.error(f"向群{group_id}推送失败: {e}，消息预览: {full_msg[:200]}...")
 
 
-# -------------------------- 定时任务（调整为10分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=10)
+# -------------------------- 定时任务（调整为5分钟减少反爬） --------------------------
+@sv.scheduled_job('interval', minutes=5)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
