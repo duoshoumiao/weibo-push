@@ -876,7 +876,7 @@ async def update_cookie(bot, ev: CQEvent):
         }, f, ensure_ascii=False, indent=2)
     
     # 测试新配置是否有效
-    test_uid = '6603867494'  # 新浪新闻的微博ID，用于测试
+    test_uid = '6220646576'  # 新浪新闻的微博ID，用于测试
     test_result = await get_weibo_user_info(test_uid, retry=1)
     if test_result:
         await bot.send(ev, f'新配置测试成功，已获取到测试账号信息：{test_result["name"]}')
