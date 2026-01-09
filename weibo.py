@@ -158,7 +158,7 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     """获取用户最新微博(带重试+格式校验+视频解析+增强错误日志+分页支持)"""    
     all_posts = []  
     page = 1  
-    max_pages = 5  # 最多请求5页,避免请求过多  
+    max_pages = 3  # 最多请求3页,避免请求过多  
       
     while len(all_posts) < count and page <= max_pages:  
         url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page={page}'    
