@@ -116,80 +116,114 @@ def parse_html_response(html_content):
     try:  
         from lxml import etree  
         import re  
-          
+            
         # 移除XML声明  
         if html_content.startswith('<?xml'):  
             html_content = re.sub(r'<\?xml[^>]*\?>', '', html_content)  
-          
+            
         # 解析HTML  
         selector = etree.HTML(html_content)  
         if selector is None:  
             sv.logger.error("HTML解析失败：selector为None")  
             return []  
-          
+            
         # 查找所有微博卡片  
         cards = selector.xpath('//div[@class="c" and starts-with(@id, "M_")]')  
         all_posts = []  
-          
+            
         for card in cards:  
             try:  
                 # 提取微博ID  
                 card_id = card.get('id', '')  
                 post_id = card_id.replace('M_', '') if card_id else 'unknown'  
-                  
+                    
                 # 提取文本内容  
                 text_parts = []  
                 text_nodes = card.xpath('.//span[@class="ctt"]/text()')  
                 for node in text_nodes:  
                     if node and node.strip():  
                         text_parts.append(node.strip())  
-                  
-                # 如果没有找到ctt，尝试其他文本节点  
+                    
                 if not text_parts:  
                     all_text = card.xpath('.//text()')  
                     for text in all_text:  
                         text = text.strip()  
                         if text and not any(x in text for x in ['转发', '评论', '赞', '来自', '原文链接']):  
                             text_parts.append(text)  
-                  
+                    
                 text = ' '.join(text_parts) if text_parts else "【无正文内容】"  
-                  
-                # 改进的图片提取  
+                    
+                # 针对多图微博的专门提取逻辑  
                 pic_urls = []  
+                found_imgs = set()  
                   
-                # 方法1：查找所有img标签  
+                sv.logger.info(f"微博 {post_id} 开始多图专项分析")  
+                  
+                # 策略1：查找所有包含图片的链接（多图通常在多个a标签中）  
+                img_links = card.xpath('.//a[.//img]')  
+                sv.logger.info(f"微博 {post_id} 找到 {len(img_links)} 个包含图片的链接")  
+                  
+                for i, link in enumerate(img_links):  
+                    # 获取链接中的所有图片  
+                    link_imgs = link.xpath('.//img')  
+                    for img in link_imgs:  
+                        src = img.get('src', '')  
+                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                            # 确保是微博图片服务器  
+                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
+                                # 保守过滤  
+                                src_lower = src.lower()  
+                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
+                                    found_imgs.add(src)  
+                                    sv.logger.info(f"链接{i}中发现图片: {src}")  
+                  
+                # 策略2：查找可能的图片组容器  
+                possible_containers = [  
+                    './/div[contains(@class, "media")]//img',  
+                    './/div[contains(@class, "gallery")]//img',   
+                    './/div[contains(@class, "photos")]//img',  
+                    './/div[contains(@class, "img")]//img',  
+                    './/span[contains(@class, "ib")]//img',  # 基于日志中的class='ib'  
+                ]  
+                  
+                for container_query in possible_containers:  
+                    container_imgs = card.xpath(container_query)  
+                    sv.logger.info(f"容器查询 '{container_query}' 找到 {len(container_imgs)} 个图片")  
+                      
+                    for img in container_imgs:  
+                        src = img.get('src', '')  
+                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
+                                src_lower = src.lower()  
+                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
+                                    found_imgs.add(src)  
+                  
+                # 策略3：查找所有img标签（备用）  
                 all_imgs = card.xpath('.//img')  
+                sv.logger.info(f"备用查询找到 {len(all_imgs)} 个img标签")  
+                  
                 for img in all_imgs:  
                     src = img.get('src', '')  
-                    if src and any(x in src.lower() for x in ['.jpg', '.jpeg', '.png', '.gif']):  
-                        # 转换为原图URL  
-                        if 'thumb' in src or 'thumbnail' in src:  
-                            # 移除缩略图标识  
-                            original_url = src.replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
-                        else:  
-                            original_url = src  
-                          
-                        # 处理相对路径  
-                        if original_url.startswith('//'):  
-                            original_url = 'https:' + original_url  
-                        elif original_url.startswith('/'):  
-                            original_url = 'https://weibo.cn' + original_url  
-                          
-                        if original_url not in pic_urls:  
-                            pic_urls.append(original_url)  
+                    if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                        if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
+                            src_lower = src.lower()  
+                            if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
+                                found_imgs.add(src)  
                   
-                # 方法2：从链接中提取图片URL  
-                links = card.xpath('.//a[contains(@href, "photo")]')  
-                for link in links:  
-                    href = link.get('href', '')  
-                    if 'photo' in href and 'weibo.cn' in href:  
-                        if href not in pic_urls:  
-                            pic_urls.append(href)  
+                # 转换为原图URL  
+                for src in found_imgs:  
+                    original_url = src.replace('/wap180/', '/large/').replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
+                    if original_url.startswith('//'):  
+                        original_url = 'https:' + original_url  
+                    if original_url not in pic_urls:  
+                        pic_urls.append(original_url)  
                   
+                sv.logger.info(f"微博 {post_id} 最终提取到 {len(pic_urls)} 张图片")  
+                    
                 # 提取时间  
                 time_elem = card.xpath('.//span[@class="ct"]')  
                 time_text = time_elem[0].text if time_elem else 'unknown'  
-                  
+                    
                 all_posts.append({  
                     'id': post_id,  
                     'text': text,  
@@ -200,13 +234,13 @@ def parse_html_response(html_content):
                     'comments_count': 0,  
                     'attitudes_count': 0  
                 })  
-                  
+                    
             except Exception as e:  
                 sv.logger.error(f"解析单个微博卡片失败: {e}")  
                 continue  
-          
+            
         return all_posts  
-          
+            
     except Exception as e:  
         sv.logger.error(f"HTML解析失败: {e}")  
         return []
