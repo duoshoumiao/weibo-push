@@ -440,70 +440,68 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     return all_posts
 
 
-async def check_and_push_new_weibo():      
-    """检查新微博并推送"""      
-    sv.logger.info("开始检查微博更新...")      
-    all_followed_uids = set()      
-    # 收集所有已关注的微博ID      
-    for follows in weibo_config['group_follows'].values():      
-        all_followed_uids.update(follows.keys())      
-          
-    for uid in all_followed_uids:      
-        try:      
-            latest_posts = await get_weibo_user_latest_posts(uid)      
-            if not latest_posts:      
-                continue      
+async def check_and_push_new_weibo():        
+    """检查新微博并推送"""        
+    sv.logger.info("开始检查微博更新...")        
+    all_followed_uids = set()        
+    # 收集所有已关注的微博ID        
+    for follows in weibo_config['group_follows'].values():        
+        all_followed_uids.update(follows.keys())        
+            
+    for uid in all_followed_uids:        
+        try:        
+            latest_posts = await get_weibo_user_latest_posts(uid)        
+            if not latest_posts:        
+                continue        
+                    
+            # 获取该用户在各群的最早 last_post_time(用于筛选新微博)        
+            min_last_post_time = ''      
+            for group_id, follows in weibo_config['group_follows'].items():      
+                if uid in follows:      
+                    current_time = follows[uid].get('last_post_time', '')      
+                    if not min_last_post_time or current_time < min_last_post_time:      
+                        min_last_post_time = current_time      
                   
-            # 获取该用户在各群的最早 last_post_time(用于筛选新微博)      
-            min_last_post_time = ''    
-            for group_id, follows in weibo_config['group_follows'].items():    
-                if uid in follows:    
-                    current_time = follows[uid].get('last_post_time', '')    
-                    if not min_last_post_time or current_time < min_last_post_time:    
-                        min_last_post_time = current_time    
-                
-            # 筛选出所有新微博（使用时间比较）    
-            new_posts = [post for post in latest_posts if post['created_time'] > min_last_post_time]   
-                  
-            if not new_posts:      
-                continue      
-                  
-            # 按时间排序(从旧到新)      
-            new_posts.sort(key=lambda x: x['created_time'])      
-                  
-            # 推送每一条新微博      
-            for post in new_posts:      
-                groups_to_push = []      
-                for group_id, follows in weibo_config['group_follows'].items():      
-                    if (uid in follows and       
-                        weibo_config['group_enable'].get(group_id, True) and       
-                        post['created_time'] > follows[uid].get('last_post_time', '')):      
-                        groups_to_push.append(group_id)      
-                      
-                if groups_to_push:      
-                    # 关键修复：强制刷新用户信息确保准确性    
-                    user_info = await get_weibo_user_info(uid, force_refresh=True)      
-                    user_name = user_info['name'] if user_info else f'用户{uid}'      
+            # 筛选出所有新微博（使用时间比较）      
+            new_posts = [post for post in latest_posts if post['created_time'] > min_last_post_time]     
+                    
+            if not new_posts:        
+                continue        
+                    
+            # 按时间排序(从旧到新)        
+            new_posts.sort(key=lambda x: x['created_time'])        
+                    
+            # 推送每一条新微博        
+            for post in new_posts:        
+                groups_to_push = []        
+                for group_id, follows in weibo_config['group_follows'].items():        
+                    if (uid in follows and         
+                        weibo_config['group_enable'].get(group_id, True) and         
+                        post['created_time'] > follows[uid].get('last_post_time', '')):        
+                        groups_to_push.append(group_id)        
                         
-                    # 验证UID匹配    
-                    if user_info and user_info.get('uid') != uid:    
-                        sv.logger.warning(f"用户信息不匹配: 请求UID={uid}, 返回UID={user_info.get('uid')}")    
-                        # 如果不匹配，重新获取一次    
-                        user_info = await get_weibo_user_info(uid, force_refresh=True)    
-                        user_name = user_info['name'] if user_info else f'用户{uid}'    
-                        
-                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)      
+                if groups_to_push:        
+                    # 关键修复：强制刷新用户信息确保准确性      
+                    user_info = await get_weibo_user_info(uid, force_refresh=True)        
+                    user_name = user_info['name'] if user_info else f'用户{uid}'        
                           
-                    # 更新每个群的last_post_time    
-                    for group_id in groups_to_push:    
-                        weibo_config['group_follows'][group_id][uid]['last_post_time'] = post['created_time']  
-                    save_config()  
-              
-        except Exception as e:      
-            sv.logger.error(f"处理微博{uid}时出错: {e}")      
-            continue   
-        
-
+                    # 验证UID匹配      
+                    if user_info and user_info.get('uid') != uid:      
+                        sv.logger.warning(f"用户信息不匹配: 请求UID={uid}, 返回UID={user_info.get('uid')}")      
+                        # 如果不匹配，重新获取一次      
+                        user_info = await get_weibo_user_info(uid, force_refresh=True)      
+                        user_name = user_info['name'] if user_info else f'用户{uid}'      
+                          
+                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)        
+                            
+                    # 更新每个群的last_post_time为当前推送的微博时间  
+                    for group_id in groups_to_push:      
+                        weibo_config['group_follows'][group_id][uid]['last_post_time'] = post['created_time']    
+                    save_config()    
+                
+        except Exception as e:        
+            sv.logger.error(f"处理微博{uid}时出错: {e}")        
+            continue
 
 async def push_weibo_to_groups(group_ids, name, uid, post):  
     """推送微博到指定群（带用户信息验证）"""  
