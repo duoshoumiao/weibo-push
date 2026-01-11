@@ -27,11 +27,11 @@ _nlmt = DailyNumberLimiter(20000)
   
 # 配置结构：群独立黑名单  
 weibo_config = {  
-    'group_follows': {},      # {group_id: {weibo_id: {name: '微博名', last_post_id: '最后一条ID'}}}  
+    'group_follows': {},      # {group_id: {weibo_id: {name: '微博名', last_post_time: '2024-01-01 12:00:00'}}}  
     'group_enable': {},       # {group_id: True/False}  
     'account_cache': {},      # {weibo_id: {name: '微博名', uid: '微博ID'}}  
     'group_blacklist': {}     # {group_id: set(weibo_id)} 群独立黑名单  
-}  
+} 
   
 def format_weibo_time(raw_time):  
     """时间格式转换为YYYY-MM-DD HH:MM:SS"""  
@@ -43,15 +43,25 @@ def format_weibo_time(raw_time):
         return raw_time    
   
 def load_config():  
-    """加载配置文件"""  
+    """加载配置文件（带向后兼容）"""  
     global weibo_config  
     if os.path.exists(CONFIG_PATH):  
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:  
             loaded_config = json.load(f)  
+              
             # 加载基础配置  
             for key in ['group_follows', 'group_enable', 'account_cache']:  
                 weibo_config[key] = loaded_config.get(key, {})  
-            # 加载群黑名单（确保为集合类型）  
+              
+            # 迁移：将last_post_id转换为last_post_time  
+            for group_id, follows in weibo_config['group_follows'].items():  
+                for uid, info in follows.items():  
+                    if 'last_post_id' in info and 'last_post_time' not in info:  
+                        # 旧版本，需要迁移  
+                        info['last_post_time'] = ''  # 重置为空，会重新获取  
+                        del info['last_post_id']  
+              
+            # 加载群黑名单  
             weibo_config['group_blacklist'] = {}  
             for group_id, uids in loaded_config.get('group_blacklist', {}).items():  
                 weibo_config['group_blacklist'][group_id] = set(uids)  
@@ -111,85 +121,136 @@ headers = {
 }
 # -----------------------------------------------------------------------------  
   
+def format_weibo_time(time_text):  
+    """将微博时间文本标准化为 YYYY-MM-DD HH:MM:SS 格式"""  
+    import re  
+    from datetime import datetime, timedelta  
+      
+    if not time_text or time_text == 'unknown':  
+        return ''  
+      
+    try:  
+        # 处理相对时间（如"3分钟前"、"1小时前"等）  
+        if '分钟前' in time_text:  
+            minutes = int(re.search(r'(\d+)分钟前', time_text).group(1))  
+            dt = datetime.now() - timedelta(minutes=minutes)  
+            return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        elif '小时前' in time_text:  
+            hours = int(re.search(r'(\d+)小时前', time_text).group(1))  
+            dt = datetime.now() - timedelta(hours=hours)  
+            return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        elif '今天' in time_text:  
+            # 格式如"今天 12:30"  
+            time_part = re.search(r'今天 (\d{2}:\d{2})', time_text).group(1)  
+            dt = datetime.now().strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
+            return dt  
+        elif '昨天' in time_text:  
+            # 格式如"昨天 12:30"  
+            time_part = re.search(r'昨天 (\d{2}:\d{2})', time_text).group(1)  
+            dt = datetime.now() - timedelta(days=1)  
+            return dt.strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
+        elif '月' in time_text and '日' in time_text:  
+            # 格式如"12月25日 12:30" 或 "12月25日"  
+            match = re.search(r'(\d{1,2})月(\d{1,2})日(?: (\d{2}:\d{2}))?', time_text)  
+            if match:  
+                month = match.group(1)  
+                day = match.group(2)  
+                time_part = match.group(3) if match.group(3) else '00:00'  
+                year = datetime.now().year  
+                return f'{year}-{month.zfill(2)}-{day.zfill(2)} {time_part}:00'  
+        elif '-' in time_text:  
+            # 格式如"2024-12-25 12:30:00"  
+            if len(time_text.split(' ')) == 2 and ':' in time_text.split(' ')[1]:  
+                return time_text  
+            else:  
+                # 可能只有日期部分  
+                return time_text + ' 00:00:00'  
+          
+        # 如果都不匹配，返回原文本  
+        return time_text  
+    except Exception as e:  
+        sv.logger.warning(f"时间格式化失败: {time_text}, 错误: {e}")  
+        return time_text  
+  
 def parse_html_response(html_content):  
     """解析HTML响应，提取微博内容"""  
     try:  
         from lxml import etree  
         import re  
-            
+              
         # 移除XML声明  
         if html_content.startswith('<?xml'):  
             html_content = re.sub(r'<\?xml[^>]*\?>', '', html_content)  
-            
+              
         # 解析HTML  
         selector = etree.HTML(html_content)  
         if selector is None:  
             sv.logger.error("HTML解析失败：selector为None")  
             return []  
-            
+              
         # 查找所有微博卡片  
         cards = selector.xpath('//div[@class="c" and starts-with(@id, "M_")]')  
         all_posts = []  
-            
+              
         for card in cards:  
             try:  
                 # 提取微博ID  
                 card_id = card.get('id', '')  
                 post_id = card_id.replace('M_', '') if card_id else 'unknown'  
-                    
+                      
                 # 提取文本内容  
                 text_parts = []  
                 text_nodes = card.xpath('.//span[@class="ctt"]/text()')  
                 for node in text_nodes:  
                     if node and node.strip():  
                         text_parts.append(node.strip())  
-                    
+                      
                 if not text_parts:  
                     all_text = card.xpath('.//text()')  
                     for text in all_text:  
                         text = text.strip()  
                         if text and not any(x in text for x in ['转发', '评论', '赞', '来自', '原文链接']):  
                             text_parts.append(text)  
-                    
+                      
                 text = ' '.join(text_parts) if text_parts else "【无正文内容】"  
-                    
+                      
                 # 针对多图微博的专门提取逻辑  
                 pic_urls = []  
                 found_imgs = set()  
-                  
+                    
                 sv.logger.info(f"微博 {post_id} 开始多图专项分析")  
-                  
+                    
                 # 策略1：查找所有包含图片的链接（多图通常在多个a标签中）  
                 img_links = card.xpath('.//a[.//img]')  
                 sv.logger.info(f"微博 {post_id} 找到 {len(img_links)} 个包含图片的链接")  
-                  
+                    
                 for i, link in enumerate(img_links):  
                     # 获取链接中的所有图片  
                     link_imgs = link.xpath('.//img')  
                     for img in link_imgs:  
                         src = img.get('src', '')  
+                        # 放宽图片过滤条件  
                         if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
-                            # 确保是微博图片服务器  
-                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
-                                # 保守过滤  
-                                src_lower = src.lower()  
-                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
-                                    found_imgs.add(src)  
+                            # 简化域名检查  
+                            if 'sinaimg' in src.lower():  
+                                # 仅过滤明显的非内容图片  
+                                if not any(x in src.lower() for x in ['h5.sinaimg.cn', '/upload/', 'avatar', 'profile']):  
+                                    found_imgs.add(src)
                                     sv.logger.info(f"链接{i}中发现图片: {src}")  
-                  
+                    
                 # 策略2：查找可能的图片组容器  
-                possible_containers = [  
+                possible_containers = [    
                     './/div[contains(@class, "media")]//img',  
-                    './/div[contains(@class, "gallery")]//img',   
+                    './/div[contains(@class, "gallery")]//img',     
                     './/div[contains(@class, "photos")]//img',  
                     './/div[contains(@class, "img")]//img',  
                     './/span[contains(@class, "ib")]//img',  # 基于日志中的class='ib'  
                 ]  
-                  
+                    
                 for container_query in possible_containers:  
                     container_imgs = card.xpath(container_query)  
                     sv.logger.info(f"容器查询 '{container_query}' 找到 {len(container_imgs)} 个图片")  
-                      
+                        
                     for img in container_imgs:  
                         src = img.get('src', '')  
                         if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
@@ -197,11 +258,11 @@ def parse_html_response(html_content):
                                 src_lower = src.lower()  
                                 if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
                                     found_imgs.add(src)  
-                  
+                    
                 # 策略3：查找所有img标签（备用）  
                 all_imgs = card.xpath('.//img')  
                 sv.logger.info(f"备用查询找到 {len(all_imgs)} 个img标签")  
-                  
+                    
                 for img in all_imgs:  
                     src = img.get('src', '')  
                     if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
@@ -209,7 +270,7 @@ def parse_html_response(html_content):
                             src_lower = src.lower()  
                             if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
                                 found_imgs.add(src)  
-                  
+                    
                 # 转换为原图URL  
                 for src in found_imgs:  
                     original_url = src.replace('/wap180/', '/large/').replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
@@ -217,30 +278,34 @@ def parse_html_response(html_content):
                         original_url = 'https:' + original_url  
                     if original_url not in pic_urls:  
                         pic_urls.append(original_url)  
-                  
-                sv.logger.info(f"微博 {post_id} 最终提取到 {len(pic_urls)} 张图片")  
                     
+                sv.logger.info(f"微博 {post_id} 最终提取到 {len(pic_urls)} 张图片")  
+                      
                 # 提取时间  
                 time_elem = card.xpath('.//span[@class="ct"]')  
                 time_text = time_elem[0].text if time_elem else 'unknown'  
-                    
+                  
+                # 标准化时间格式  
+                formatted_time = format_weibo_time(time_text)  
+                      
                 all_posts.append({  
                     'id': post_id,  
                     'text': text,  
                     'pics': pic_urls,  
                     'video': {'play_page_url': '', 'cover_url': ''},  
                     'created_at': time_text,  
+                    'created_time': formatted_time,  # 新增标准化时间字段  
                     'reposts_count': 0,  
                     'comments_count': 0,  
                     'attitudes_count': 0  
                 })  
-                    
+                      
             except Exception as e:  
                 sv.logger.error(f"解析单个微博卡片失败: {e}")  
                 continue  
-            
+              
         return all_posts  
-            
+              
     except Exception as e:  
         sv.logger.error(f"HTML解析失败: {e}")  
         return []
@@ -375,68 +440,68 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     return all_posts
 
 
-async def check_and_push_new_weibo():    
-    """检查新微博并推送"""    
-    sv.logger.info("开始检查微博更新...")    
-    all_followed_uids = set()    
-    # 收集所有已关注的微博ID    
-    for follows in weibo_config['group_follows'].values():    
-        all_followed_uids.update(follows.keys())    
-        
-    for uid in all_followed_uids:    
-        try:    
-            latest_posts = await get_weibo_user_latest_posts(uid)    
-            if not latest_posts:    
-                continue    
-                
-            # 获取该用户在各群的最早 last_post_id(用于筛选新微博)    
-            min_last_post_id = ''    
+async def check_and_push_new_weibo():      
+    """检查新微博并推送"""      
+    sv.logger.info("开始检查微博更新...")      
+    all_followed_uids = set()      
+    # 收集所有已关注的微博ID      
+    for follows in weibo_config['group_follows'].values():      
+        all_followed_uids.update(follows.keys())      
+          
+    for uid in all_followed_uids:      
+        try:      
+            latest_posts = await get_weibo_user_latest_posts(uid)      
+            if not latest_posts:      
+                continue      
+                  
+            # 获取该用户在各群的最早 last_post_time(用于筛选新微博)      
+            min_last_post_time = ''    
             for group_id, follows in weibo_config['group_follows'].items():    
                 if uid in follows:    
-                    current_id = follows[uid]['last_post_id']    
-                    if not min_last_post_id or current_id < min_last_post_id:    
-                        min_last_post_id = current_id    
+                    current_time = follows[uid].get('last_post_time', '')    
+                    if not min_last_post_time or current_time < min_last_post_time:    
+                        min_last_post_time = current_time    
                 
-            # 筛选出所有新微博    
-            new_posts = [post for post in latest_posts if post['id'] > min_last_post_id]    
-                
-            if not new_posts:    
-                continue    
-                
-            # 按ID排序(从旧到新)    
-            new_posts.sort(key=lambda x: x['id'])    
-                
-            # 推送每一条新微博    
-            for post in new_posts:    
-                groups_to_push = []    
-                for group_id, follows in weibo_config['group_follows'].items():    
-                    if (uid in follows and     
-                        weibo_config['group_enable'].get(group_id, True) and     
-                        post['id'] > follows[uid]['last_post_id']):    
-                        groups_to_push.append(group_id)    
-                    
-                if groups_to_push:    
-                    # 关键修复：强制刷新用户信息确保准确性  
-                    user_info = await get_weibo_user_info(uid, force_refresh=True)    
-                    user_name = user_info['name'] if user_info else f'用户{uid}'    
+            # 筛选出所有新微博（使用时间比较）    
+            new_posts = [post for post in latest_posts if post['created_time'] > min_last_post_time]   
+                  
+            if not new_posts:      
+                continue      
+                  
+            # 按时间排序(从旧到新)      
+            new_posts.sort(key=lambda x: x['created_time'])      
+                  
+            # 推送每一条新微博      
+            for post in new_posts:      
+                groups_to_push = []      
+                for group_id, follows in weibo_config['group_follows'].items():      
+                    if (uid in follows and       
+                        weibo_config['group_enable'].get(group_id, True) and       
+                        post['created_time'] > follows[uid].get('last_post_time', '')):      
+                        groups_to_push.append(group_id)      
                       
-                    # 验证UID匹配  
-                    if user_info and user_info.get('uid') != uid:  
-                        sv.logger.warning(f"用户信息不匹配: 请求UID={uid}, 返回UID={user_info.get('uid')}")  
-                        # 如果不匹配，重新获取一次  
-                        user_info = await get_weibo_user_info(uid, force_refresh=True)  
-                        user_name = user_info['name'] if user_info else f'用户{uid}'  
-                      
-                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)    
+                if groups_to_push:      
+                    # 关键修复：强制刷新用户信息确保准确性    
+                    user_info = await get_weibo_user_info(uid, force_refresh=True)      
+                    user_name = user_info['name'] if user_info else f'用户{uid}'      
                         
-                    # 更新每个群的last_post_id    
+                    # 验证UID匹配    
+                    if user_info and user_info.get('uid') != uid:    
+                        sv.logger.warning(f"用户信息不匹配: 请求UID={uid}, 返回UID={user_info.get('uid')}")    
+                        # 如果不匹配，重新获取一次    
+                        user_info = await get_weibo_user_info(uid, force_refresh=True)    
+                        user_name = user_info['name'] if user_info else f'用户{uid}'    
+                        
+                    await push_weibo_to_groups(groups_to_push, user_name, uid, post)      
+                          
+                    # 更新每个群的last_post_time    
                     for group_id in groups_to_push:    
-                        weibo_config['group_follows'][group_id][uid]['last_post_id'] = post['id']    
-                    save_config()    
-            
-        except Exception as e:    
-            sv.logger.error(f"处理微博{uid}时出错: {e}")    
-            continue    
+                        weibo_config['group_follows'][group_id][uid]['last_post_time'] = post['created_time']  
+                    save_config()  
+              
+        except Exception as e:      
+            sv.logger.error(f"处理微博{uid}时出错: {e}")      
+            continue   
         
 
 
@@ -480,8 +545,8 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
             sv.logger.error(f"向群{group_id}推送失败: {e}，消息预览: {full_msg[:200]}...")
 
 
-# -------------------------- 定时任务（调整为5分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=5)
+# -------------------------- 定时任务（调整为10分钟减少反爬） --------------------------
+@sv.scheduled_job('interval', minutes=10)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
@@ -517,12 +582,13 @@ async def follow_weibo(bot, ev: CQEvent):
         name = weibo_config['group_follows'][group_id][uid]['name']
         await bot.finish(ev, f'本群已经关注过 {name} 啦~')
     
-    latest_posts = await get_weibo_user_latest_posts(uid, 1)
-    last_post_id = latest_posts[0]['id'] if latest_posts and len(latest_posts) > 0 else ''
-    
-    weibo_config['group_follows'][group_id][uid] = {
-        'name': user_info['name'],
-        'last_post_id': last_post_id
+    latest_posts = await get_weibo_user_latest_posts(uid, 1)  
+    last_post_time = latest_posts[0]['created_time'] if latest_posts and len(latest_posts) > 0 else ''  
+      
+    # 在循环中使用  
+    weibo_config['group_follows'][group_id][uid] = {  
+        'name': user_info['name'],  
+        'last_post_time': last_post_time  # 改为保存时间   
     }
     
     if group_id not in weibo_config['group_enable']:
