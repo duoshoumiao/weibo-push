@@ -602,118 +602,124 @@ async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
 # 关注微博账号
-@sv.on_prefix(('关注微博', '订阅微博'))
-async def follow_weibo(bot, ev: CQEvent):
-    group_id = str(ev.group_id)
-    user_id = ev.user_id
-    
-    if not _nlmt.check(user_id):
-        await bot.finish(ev, '今日关注微博次数已达上限，请明天再试~')
-    if not flmt.check(user_id):
-        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')
-    
-    uid = ev.message.extract_plain_text().strip()
-    if not uid:
-        await bot.finish(ev, '请输入要关注的微博ID哦~')
-    
-    # 检查是否在本群黑名单中
-    group_blacklist = weibo_config['group_blacklist'].get(group_id, set())
-    if uid in group_blacklist:
-        await bot.finish(ev, f'该微博ID({uid})已在本群黑名单中，禁止关注~')
-    
-    # 验证微博ID有效性
-    user_info = await get_weibo_user_info(uid, force_refresh=True)
-    if not user_info:
-        await bot.finish(ev, f'未查询到微博ID为{uid}的用户，请检查ID是否正确~')
-    
-    if group_id not in weibo_config['group_follows']:
-        weibo_config['group_follows'][group_id] = {}
-    
-    if uid in weibo_config['group_follows'][group_id]:
-        name = weibo_config['group_follows'][group_id][uid]['name']
-        await bot.finish(ev, f'本群已经关注过 {name} 啦~')
-    
-    latest_posts = await get_weibo_user_latest_posts(uid, 1)  
-    last_post_time = latest_posts[0]['created_time'] if latest_posts and len(latest_posts) > 0 else ''  
+@sv.on_prefix(('关注微博', '订阅微博'))  
+async def follow_weibo(bot, ev: CQEvent):  
+    group_id = str(ev.group_id)  
+    user_id = ev.user_id  
+      
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日关注微博次数已达上限，请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    # 解析UID和微博名  
+    text = ev.message.extract_plain_text().strip()  
+    parts = text.split(maxsplit=1)  
+    uid = parts[0] if parts else ''  
+    name = parts[1] if len(parts) > 1 else f'用户{uid}'  
+      
+    if not uid:  
+        await bot.finish(ev, '请输入要关注的微博ID和微博名，格式：关注微博 UID 微博名')  
+      
+    # 检查是否在本群黑名单中  
+    group_blacklist = weibo_config['group_blacklist'].get(group_id, set())  
+    if uid in group_blacklist:  
+        await bot.finish(ev, f'该微博ID({uid})已在本群黑名单中，禁止关注~')  
+      
+    # 验证微博ID有效性（仅验证，不获取名称）  
+    user_info = await get_weibo_user_info(uid, force_refresh=True)  
+    if not user_info:  
+        await bot.finish(ev, f'未查询到微博ID为{uid}的用户，请检查ID是否正确~')  
+      
+    if group_id not in weibo_config['group_follows']:  
+        weibo_config['group_follows'][group_id] = {}  
+      
+    if uid in weibo_config['group_follows'][group_id]:  
+        saved_name = weibo_config['group_follows'][group_id][uid]['name']  
+        await bot.finish(ev, f'本群已经关注过 {saved_name} 啦~')  
       
     # 直接使用当前时间  
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')    
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  
       
-    # 保存到配置  
-    weibo_config['group_follows'][group_id][uid] = {    
-        'name': user_info['name'],    
-        'last_post_time': current_time    
-    }
-    
-    if group_id not in weibo_config['group_enable']:
-        weibo_config['group_enable'][group_id] = True
-    
-    save_config()
-    _nlmt.increase(user_id)
-    flmt.start_cd(user_id)
-    await bot.send(ev, f'本群成功关注 {user_info["name"]} 的微博啦~ 有新动态会第一时间通知哦~')
+    # 保存到配置（使用命令中提供的名称）  
+    weibo_config['group_follows'][group_id][uid] = {  
+        'name': name,  
+        'last_post_time': current_time  
+    }  
+      
+    if group_id not in weibo_config['group_enable']:  
+        weibo_config['group_enable'][group_id] = True  
+      
+    save_config()  
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)  
+    await bot.send(ev, f'本群成功关注 {name} 的微博啦~ 有新动态会第一时间通知哦~')
 
-# 全群关注微博功能
-@sv.on_prefix(('全群关注微博', '全群订阅微博'))
-async def follow_weibo_all_groups(bot, ev: CQEvent):
-    user_id = ev.user_id
-    
-    # 仅允许管理员执行全群操作
-    if not priv.check_priv(ev, priv.ADMIN):
-        await bot.finish(ev, '只有管理员才能操作全群关注哦~')
-    
-    if not _nlmt.check(user_id):
-        await bot.finish(ev, '今日全群关注微博次数已达上限，请明天再试~')
-    if not flmt.check(user_id):
-        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')
-    
-    uid = ev.message.extract_plain_text().strip()
-    if not uid:
-        await bot.finish(ev, '请输入要全群关注的微博ID哦~')
-    
-    # 验证微博ID有效性
-    user_info = await get_weibo_user_info(uid, force_refresh=True)
-    if not user_info:
-        await bot.finish(ev, f'未查询到微博ID为{uid}的用户，请检查ID是否正确~')
-    
-    # 获取所有已加入的群
-    groups = await bot.get_group_list()
-    if not groups:
-        await bot.finish(ev, '未加入任何群组，无法进行全群关注~')
-    
-    latest_posts = await get_weibo_user_latest_posts(uid, 1)
-    last_post_id = latest_posts[0]['id'] if latest_posts and len(latest_posts) > 0 else ''
-    
-    # 记录受影响的群数量
-    new_follow_count = 0
-    
-    for group in groups:
-        group_id = str(group['group_id'])
-        
-        # 检查该群是否将该uid加入黑名单，若是则跳过
-        group_blacklist = weibo_config['group_blacklist'].get(group_id, set())
-        if uid in group_blacklist:
-            continue  # 跳过该群
-        
-        # 初始化群配置（如果不存在）
-        if group_id not in weibo_config['group_follows']:
-            weibo_config['group_follows'][group_id] = {}
-        
-        # 仅处理未关注的群
-        if uid not in weibo_config['group_follows'][group_id]:
-            weibo_config['group_follows'][group_id][uid] = {
-                'name': user_info['name'],
-                'last_post_id': last_post_id
-            }
-            new_follow_count += 1
-        
-        # 确保开启推送
-        weibo_config['group_enable'][group_id] = True
-    
-    save_config()
-    _nlmt.increase(user_id)
-    flmt.start_cd(user_id)
-    await bot.send(ev, f'成功为{new_follow_count}个群开启 {user_info["name"]} 的微博关注~ 有新动态会第一时间通知哦~')
+@sv.on_prefix(('全群关注微博', '全群订阅微博'))  
+async def follow_weibo_all_groups(bot, ev: CQEvent):  
+    user_id = ev.user_id  
+      
+    # 仅允许管理员执行全群操作  
+    if not priv.check_priv(ev, priv.ADMIN):  
+        await bot.finish(ev, '只有管理员才能操作全群关注哦~')  
+      
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日全群关注微博次数已达上限，请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    # 解析UID和微博名  
+    text = ev.message.extract_plain_text().strip()  
+    parts = text.split(maxsplit=1)  
+    uid = parts[0] if parts else ''  
+    name = parts[1] if len(parts) > 1 else f'用户{uid}'  
+      
+    if not uid:  
+        await bot.finish(ev, '请输入要全群关注的微博ID和微博名，格式：全群关注微博 UID 微博名')  
+      
+    # 验证微博ID有效性（仅验证，不获取名称）  
+    user_info = await get_weibo_user_info(uid, force_refresh=True)  
+    if not user_info:  
+        await bot.finish(ev, f'未查询到微博ID为{uid}的用户，请检查ID是否正确~')  
+      
+    # 获取所有已加入的群  
+    groups = await bot.get_group_list()  
+    if not groups:  
+        await bot.finish(ev, '未加入任何群组，无法进行全群关注~')  
+      
+    # 直接使用当前时间  
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  
+      
+    # 记录受影响的群数量  
+    new_follow_count = 0  
+      
+    for group in groups:  
+        group_id = str(group['group_id'])  
+          
+        # 检查该群是否将该uid加入黑名单，若是则跳过  
+        group_blacklist = weibo_config['group_blacklist'].get(group_id, set())  
+        if uid in group_blacklist:  
+            continue  # 跳过该群  
+          
+        # 初始化群配置（如果不存在）  
+        if group_id not in weibo_config['group_follows']:  
+            weibo_config['group_follows'][group_id] = {}  
+          
+        # 仅处理未关注的群  
+        if uid not in weibo_config['group_follows'][group_id]:  
+            weibo_config['group_follows'][group_id][uid] = {  
+                'name': name,  
+                'last_post_time': current_time  
+            }  
+            new_follow_count += 1  
+          
+        # 确保开启推送  
+        weibo_config['group_enable'][group_id] = True  
+      
+    save_config()  
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)  
+    await bot.send(ev, f'成功为{new_follow_count}个群开启 {name} 的微博关注~ 有新动态会第一时间通知哦~')
 
 # 群内黑名单管理命令
 @sv.on_prefix(('微博黑名单', '添加微博黑名单'))
@@ -855,8 +861,8 @@ async def toggle_weibo_push(bot, ev: CQEvent):
 @sv.on_fullmatch(('微博推送帮助', '微博订阅帮助'))  
 async def weibo_help(bot, ev: CQEvent):  
     help_msg = '''微博推送插件帮助:  
-- 关注微博 [微博ID]:关注指定微博账号(仅本群生效)  
-- 全群关注微博 [微博ID]:所有已加入的群都关注并开启推送(管理员)  
+- 关注微博 [微博ID+微博名]:关注指定微博账号(仅本群生效)  
+- 全群关注微博 [微博ID+微博名]:所有已加入的群都关注并开启推送(管理员)  
 - 取消关注微博 [微博ID]:取消关注指定微博账号(仅本群生效)  
 - 全群取消关注微博 [微博ID]:所有已加入的群都取消关注(管理员)  
 - 查看关注的微博:查看本群已关注的微博账号  
