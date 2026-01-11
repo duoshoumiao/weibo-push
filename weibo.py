@@ -545,9 +545,21 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
         name = fresh_user_info['name']  
         sv.logger.info(f"使用最新用户名: {name} (UID: {uid})")  
     else:  
-        # 获取失败时使用默认格式  
-        name = f'用户{uid}'  
-        sv.logger.warning(f"无法获取用户{uid}信息，使用默认名称")  
+        # 修改：优先从配置中获取缓存的名称  
+        cached_name = None  
+        for group_id in group_ids:  
+            if (group_id in weibo_config['group_follows'] and   
+                uid in weibo_config['group_follows'][group_id]):  
+                cached_name = weibo_config['group_follows'][group_id][uid].get('name')  
+                break  
+          
+        if cached_name:  
+            name = cached_name  
+            sv.logger.info(f"使用缓存用户名: {name} (UID: {uid})")  
+        else:  
+            # 最后才使用默认格式  
+            name = f'用户{uid}'  
+            sv.logger.warning(f"无法获取用户{uid}信息且无缓存，使用默认名称")  
       
     # 组装消息  
     msg_parts = [  
