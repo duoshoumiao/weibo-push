@@ -858,6 +858,7 @@ async def weibo_help(bot, ev: CQEvent):
 - 查看微博黑名单:查看本群黑名单中的微博ID(管理员)  
 - 官方半月刊：查看PCR半月刊
 - 更新cookie + cookie  
+- 检查微博更新
 注:微博ID是指微博的数字ID,不是昵称哦~'''  
     await bot.send(ev, help_msg)
 
@@ -1028,3 +1029,30 @@ async def update_cookie(bot, ev: CQEvent):
         await bot.send(ev, f'新配置测试成功，已获取到测试账号信息：{test_result["name"]}')
     else:
         await bot.send(ev, '新配置测试失败，可能Cookie已过期或格式错误，请重新检查~')
+       
+# 主动检查微博更新  
+@sv.on_fullmatch(('检查微博更新', '检查微博', '微博检查'))  
+async def manual_check_weibo(bot, ev: CQEvent):  
+    """手动触发检查所有关注的微博更新"""  
+    user_id = ev.user_id  
+      
+    # 频率限制检查  
+    if not _nlmt.check(user_id):  
+        await bot.finish(ev, '今日检查次数已达上限，请明天再试~')  
+    if not flmt.check(user_id):  
+        await bot.finish(ev, f'操作太频繁啦，请{int(flmt.left_time(user_id)) + 1}秒后再试~')  
+      
+    # 发送开始检查的消息  
+    await bot.send(ev, '🔍 正在检查微博更新，请稍候...')  
+      
+    try:  
+        # 调用核心检查函数  
+        await check_and_push_new_weibo()  
+        await bot.send(ev, '✅ 微博检查完成！如有新动态已推送至相关群组')  
+    except Exception as e:  
+        sv.logger.error(f"手动检查微博失败: {e}")  
+        await bot.send(ev, f'❌ 检查过程中出现错误: {str(e)}')  
+      
+    # 更新频率限制  
+    _nlmt.increase(user_id)  
+    flmt.start_cd(user_id)       
