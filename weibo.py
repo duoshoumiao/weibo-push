@@ -537,29 +537,28 @@ async def check_and_push_new_weibo():
             continue
 
 async def push_weibo_to_groups(group_ids, name, uid, post):  
-    """推送微博到指定群（带用户信息验证）"""  
-    # 移除所有特殊判断，统一处理  
-    fresh_user_info = await get_weibo_user_info(uid, force_refresh=True)  
-    if fresh_user_info:  
-        # 始终使用最新获取的用户名  
-        name = fresh_user_info['name']  
-        sv.logger.info(f"使用最新用户名: {name} (UID: {uid})")  
-    else:  
-        # 修改：优先从配置中获取缓存的名称  
-        cached_name = None  
-        for group_id in group_ids:  
-            if (group_id in weibo_config['group_follows'] and   
-                uid in weibo_config['group_follows'][group_id]):  
-                cached_name = weibo_config['group_follows'][group_id][uid].get('name')  
+    """推送微博到指定群（优先使用配置文件中的自定义名称）"""  
+    # 优先从 group_follows 中获取自定义名称  
+    custom_name = None  
+    for group_id in group_ids:  
+        if (group_id in weibo_config['group_follows'] and   
+            uid in weibo_config['group_follows'][group_id]):  
+            custom_name = weibo_config['group_follows'][group_id][uid].get('name')  
+            if custom_name and custom_name.strip() and not custom_name.startswith('用户'):  
                 break  
-          
-        if cached_name:  
-            name = cached_name  
-            sv.logger.info(f"使用缓存用户名: {name} (UID: {uid})")  
+      
+    if custom_name and custom_name.strip() and not custom_name.startswith('用户'):  
+        # 使用配置文件中的自定义名称  
+        name = custom_name  
+        sv.logger.info(f"使用自定义名称: {name} (UID: {uid})")  
+    else:  
+        # 只有在没有自定义名称时才获取用户信息  
+        user_info = await get_weibo_user_info(uid)  
+        if user_info:  
+            name = user_info['name']  
+            sv.logger.info(f"使用API获取的名称: {name} (UID: {uid})")  
         else:  
-            # 最后才使用默认格式  
             name = f'用户{uid}'  
-            sv.logger.warning(f"无法获取用户{uid}信息且无缓存，使用默认名称")  
       
     # 组装消息  
     msg_parts = [  
