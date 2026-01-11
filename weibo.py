@@ -116,7 +116,6 @@ def parse_html_response(html_content):
     try:  
         from lxml import etree  
         import re  
-        import json  
             
         # 移除XML声明  
         if html_content.startswith('<?xml'):  
@@ -154,63 +153,70 @@ def parse_html_response(html_content):
                     
                 text = ' '.join(text_parts) if text_parts else "【无正文内容】"  
                     
-                # 从JavaScript数据中提取图片  
+                # 针对多图微博的专门提取逻辑  
                 pic_urls = []  
+                found_imgs = set()  
                   
-                sv.logger.info(f"微博 {post_id} 开始JavaScript数据搜索")  
+                sv.logger.info(f"微博 {post_id} 开始多图专项分析")  
                   
-                # 查找整个页面的script标签内容  
-                scripts = selector.xpath('//script/text()')  
-                js_pics_found = 0  
+                # 策略1：查找所有包含图片的链接（多图通常在多个a标签中）  
+                img_links = card.xpath('.//a[.//img]')  
+                sv.logger.info(f"微博 {post_id} 找到 {len(img_links)} 个包含图片的链接")  
                   
-                for script in scripts:  
-                    if 'pics' in script and '$render_data' in script:  
-                        sv.logger.info(f"在JavaScript中发现$render_data数据")  
-                          
-                        # 提取$render_data变量  
-                        render_data_match = re.search(r'var\s+\$render_data\s*=\s*(\[.*?\]);', script, re.DOTALL)  
-                        if render_data_match:  
-                            try:  
-                                render_data_json = render_data_match.group(1)  
-                                render_data = json.loads(render_data_json)  
-                                  
-                                # 遍历render_data数组查找pics  
-                                for item in render_data:  
-                                    if isinstance(item, dict) and 'status' in item:  
-                                        status = item.get('status', {})  
-                                        pics = status.get('pics', [])  
-                                          
-                                        sv.logger.info(f"在status中找到 {len(pics)} 张图片")  
-                                          
-                                        for pic in pics:  
-                                            if isinstance(pic, dict) and 'large' in pic:  
-                                                large_url = pic['large'].get('url', '')  
-                                                if large_url and large_url not in pic_urls:  
-                                                    pic_urls.append(large_url)  
-                                                    js_pics_found += 1  
-                                  
-                                if js_pics_found > 0:  
-                                    sv.logger.info(f"从JavaScript成功提取 {js_pics_found} 张图片")  
-                                    break  
-                                      
-                            except json.JSONDecodeError as e:  
-                                sv.logger.warning(f"JavaScript JSON解析失败: {e}")  
-                                continue  
-                  
-                # 如果JavaScript没有找到图片，回退到HTML解析  
-                if not pic_urls:  
-                    sv.logger.info(f"JavaScript未找到图片，回退到HTML解析")  
-                    all_imgs = card.xpath('.//img[contains(@src, "sinaimg")]')  
-                    for img in all_imgs:  
+                for i, link in enumerate(img_links):  
+                    # 获取链接中的所有图片  
+                    link_imgs = link.xpath('.//img')  
+                    for img in link_imgs:  
                         src = img.get('src', '')  
-                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):  
+                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                            # 确保是微博图片服务器  
+                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
+                                # 保守过滤  
+                                src_lower = src.lower()  
+                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
+                                    found_imgs.add(src)  
+                                    sv.logger.info(f"链接{i}中发现图片: {src}")  
+                  
+                # 策略2：查找可能的图片组容器  
+                possible_containers = [  
+                    './/div[contains(@class, "media")]//img',  
+                    './/div[contains(@class, "gallery")]//img',   
+                    './/div[contains(@class, "photos")]//img',  
+                    './/div[contains(@class, "img")]//img',  
+                    './/span[contains(@class, "ib")]//img',  # 基于日志中的class='ib'  
+                ]  
+                  
+                for container_query in possible_containers:  
+                    container_imgs = card.xpath(container_query)  
+                    sv.logger.info(f"容器查询 '{container_query}' 找到 {len(container_imgs)} 个图片")  
+                      
+                    for img in container_imgs:  
+                        src = img.get('src', '')  
+                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
+                                src_lower = src.lower()  
+                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
+                                    found_imgs.add(src)  
+                  
+                # 策略3：查找所有img标签（备用）  
+                all_imgs = card.xpath('.//img')  
+                sv.logger.info(f"备用查询找到 {len(all_imgs)} 个img标签")  
+                  
+                for img in all_imgs:  
+                    src = img.get('src', '')  
+                    if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
+                        if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
                             src_lower = src.lower()  
                             if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
-                                original_url = src.replace('/wap180/', '/large/').replace('/thumb/', '/large/')  
-                                if original_url.startswith('//'):  
-                                    original_url = 'https:' + original_url  
-                                if original_url not in pic_urls:  
-                                    pic_urls.append(original_url)  
+                                found_imgs.add(src)  
+                  
+                # 转换为原图URL  
+                for src in found_imgs:  
+                    original_url = src.replace('/wap180/', '/large/').replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
+                    if original_url.startswith('//'):  
+                        original_url = 'https:' + original_url  
+                    if original_url not in pic_urls:  
+                        pic_urls.append(original_url)  
                   
                 sv.logger.info(f"微博 {post_id} 最终提取到 {len(pic_urls)} 张图片")  
                     
