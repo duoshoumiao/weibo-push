@@ -325,20 +325,26 @@ async def get_weibo_user_info(uid, retry=2, force_refresh=False):
         cached_info = weibo_config['account_cache'][uid]  
         # 验证缓存的UID是否匹配  
         if cached_info.get('uid') == uid:  
+            # 确保缓存中有有效的用户名  
+            if not cached_info.get('name'):  
+                cached_info['name'] = f'用户{uid}'  
+                weibo_config['account_cache'][uid] = cached_info  
+                save_config()  
             return cached_info  
         else:  
             # 缓存不匹配，清除并重新获取  
+            sv.logger.warning(f"缓存UID不匹配，清除缓存: 缓存={cached_info.get('uid')}, 请求={uid}")  
             del weibo_config['account_cache'][uid]  
             save_config()  
       
     url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}'  
-    for _ in range(retry + 1):  
+    for attempt in range(retry + 1):  
         try:  
             async with aiohttp.ClientSession(headers=headers) as session:  
                 async with session.get(url, timeout=10) as resp:  
                     # 校验响应是否为JSON  
                     if 'application/json' not in resp.headers.get('Content-Type', ''):  
-                        sv.logger.warning(f"用户{uid}信息非JSON响应，重试中")  
+                        sv.logger.warning(f"用户{uid}信息非JSON响应(尝试{attempt+1}/{retry+1})，重试中")  
                         await asyncio.sleep(3)  
                         continue  
                       
@@ -346,23 +352,50 @@ async def get_weibo_user_info(uid, retry=2, force_refresh=False):
                     if data.get('ok') == 1:  
                         user_info = data.get('data', {}).get('userInfo', {})  
                         if not user_info:  
-                            return None  
+                            sv.logger.warning(f"用户{uid}信息为空，API返回: {data}")  
+                            # 返回默认用户信息而不是None  
+                            result = {  
+                                'name': f'用户{uid}',  
+                                'uid': uid  
+                            }  
+                            weibo_config['account_cache'][uid] = result  
+                            save_config()  
+                            return result  
+                          
                         # 缓存用户信息  
                         result = {  
                             'name': user_info.get('screen_name', f'用户{uid}'),  
                             'uid': uid  
                         }  
+                          
+                        # 确保用户名不为空  
+                        if not result['name'] or result['name'].strip() == '':  
+                            result['name'] = f'用户{uid}'  
+                            sv.logger.warning(f"用户{uid}获取到空用户名，使用默认值")  
+                          
                         weibo_config['account_cache'][uid] = result  
                         save_config()  
+                        sv.logger.info(f"成功获取用户{uid}信息: {result['name']}")  
                         return result  
-                    sv.logger.warning(f"用户{uid}信息获取失败，API返回: {data}")  
-                    await asyncio.sleep(3)  
+                      
+                    sv.logger.warning(f"用户{uid}信息获取失败(尝试{attempt+1}/{retry+1})，API返回: {data}")  
+                    if attempt < retry:  
+                        await asyncio.sleep(3)  
+                      
         except Exception as e:  
-            sv.logger.error(f"用户{uid}信息请求异常: {e}，重试中")  
-            await asyncio.sleep(3)  
+            sv.logger.error(f"用户{uid}信息请求异常(尝试{attempt+1}/{retry+1}): {e}")  
+            if attempt < retry:  
+                await asyncio.sleep(3)  
       
-    sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数）")  
-    return None
+    # 所有重试失败后，返回默认用户信息  
+    sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数），使用默认用户名")  
+    result = {  
+        'name': f'用户{uid}',  
+        'uid': uid  
+    }  
+    weibo_config['account_cache'][uid] = result  
+    save_config()  
+    return result
     
 async def get_weibo_user_latest_posts(uid, count=5, retry=2):  
     """获取用户最新微博(HTML抓取版本)"""  
@@ -482,7 +515,7 @@ async def check_and_push_new_weibo():
                         
                 if groups_to_push:        
                     # 关键修复：强制刷新用户信息确保准确性      
-                    user_info = await get_weibo_user_info(uid, force_refresh=True)        
+                    user_info = await get_weibo_user_info(uid)        
                     user_name = user_info['name'] if user_info else f'用户{uid}'        
                           
                     # 验证UID匹配      
@@ -505,19 +538,22 @@ async def check_and_push_new_weibo():
 
 async def push_weibo_to_groups(group_ids, name, uid, post):  
     """推送微博到指定群（带用户信息验证）"""  
-    # 验证用户信息是否匹配  
-    if uid != '6603867494':  # 如果不是公主连结官方账号  
-        # 重新获取用户信息以确保准确性  
-        fresh_user_info = await get_weibo_user_info(uid, force_refresh=True)  
-        if fresh_user_info and fresh_user_info['name'] != name:  
-            sv.logger.warning(f"用户名不匹配: 缓存={name}, 实际={fresh_user_info['name']}, UID={uid}")  
-            name = fresh_user_info['name']  
+    # 移除所有特殊判断，统一处理  
+    fresh_user_info = await get_weibo_user_info(uid, force_refresh=True)  
+    if fresh_user_info:  
+        # 始终使用最新获取的用户名  
+        name = fresh_user_info['name']  
+        sv.logger.info(f"使用最新用户名: {name} (UID: {uid})")  
+    else:  
+        # 获取失败时使用默认格式  
+        name = f'用户{uid}'  
+        sv.logger.warning(f"无法获取用户{uid}信息，使用默认名称")  
       
     # 组装消息  
     msg_parts = [  
         f"📢 {name} (ID: {uid}) 发布新微博：\n",  
         f"{post['text']}\n\n"  
-    ]  
+    ]   
       
     # 追加图片  
     for pic_url in post['pics']:  
