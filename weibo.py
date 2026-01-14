@@ -568,7 +568,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
       
     # 组装消息  
     msg_parts = [  
-        f"📢 {name} (ID: {uid}) 发布新微博：\n",  
+        f"📢 {name} (ID: {uid}) 发布新微博",  
         f"{post['text']}\n\n"  
     ]   
       
