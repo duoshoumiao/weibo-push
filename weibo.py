@@ -212,7 +212,7 @@ def parse_html_response(html_content):
                         if text and not any(x in text for x in ['转发', '评论', '赞', '来自', '原文链接']):  
                             text_parts.append(text)  
                       
-                text = ' '.join(text_parts) if text_parts else "【无正文内容】"  
+                text = '\n'.join(text_parts) if text_parts else "【无正文内容】" 
                       
                 # 针对多图微博的专门提取逻辑  
                 pic_urls = []  
