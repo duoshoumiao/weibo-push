@@ -33,14 +33,71 @@ weibo_config = {
     'group_blacklist': {}     # {group_id: set(weibo_id)} 群独立黑名单  
 } 
   
-def format_weibo_time(raw_time):  
-    """时间格式转换为YYYY-MM-DD HH:MM:SS"""  
+def format_weibo_time(time_text):  
+    """将微博时间文本标准化为 YYYY-MM-DD HH:MM:SS 格式"""  
+    import re  
+    from datetime import datetime, timedelta  
+  
+    if not time_text or time_text == 'unknown':  
+        return ''  
+  
     try:  
-        dt = datetime.strptime(raw_time, '%a %b %d %H:%M:%S %z %Y')  
-        return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        # 处理API格式（如 "Sun Mar 09 12:00:00 +0800 2026"）  
+        try:  
+            dt = datetime.strptime(time_text, '%a %b %d %H:%M:%S %z %Y')  
+            return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        except (ValueError, AttributeError):  
+            pass  
+          
+        # 处理 "YYYY-MM-DD HH:MM" 格式（无秒）  
+        if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', time_text):  
+            return time_text + ':00'  
+          
+        # (keep all existing branches below: 分钟前, 小时前, 今天, 昨天, 月/日, etc.)
+  
+        # 处理相对时间（如"3分钟前"、"1小时前"等）  
+        if '分钟前' in time_text:  
+            minutes = int(re.search(r'(\d+)分钟前', time_text).group(1))  
+            dt = datetime.now() - timedelta(minutes=minutes)  
+            return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        elif '小时前' in time_text:  
+            hours = int(re.search(r'(\d+)小时前', time_text).group(1))  
+            dt = datetime.now() - timedelta(hours=hours)  
+            return dt.strftime('%Y-%m-%d %H:%M:%S')  
+        elif '今天' in time_text:  
+            time_part = re.search(r'今天 (\d{2}:\d{2})', time_text).group(1)  
+            dt = datetime.now().strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
+            return dt  
+        elif '昨天' in time_text:  
+            time_part = re.search(r'昨天 (\d{2}:\d{2})', time_text).group(1)  
+            dt = datetime.now() - timedelta(days=1)  
+            return dt.strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
+        elif '月' in time_text and '日' in time_text:  
+            match = re.search(r'(\d{1,2})月(\d{1,2})日(?: (\d{2}:\d{2}))?', time_text)  
+            if match:  
+                month = match.group(1)  
+                day = match.group(2)  
+                time_part = match.group(3) if match.group(3) else '00:00'  
+                year = datetime.now().year  
+                return f'{year}-{month.zfill(2)}-{day.zfill(2)} {time_part}:00'  
+        elif '-' in time_text:  
+            # 格式如"2024-12-25 12:30:00" 或 "2024-12-25 12:30" 或 "2024-12-25"  
+            parts = time_text.split(' ')  
+            if len(parts) == 2 and ':' in parts[1]:  
+                time_part = parts[1]  
+                if time_part.count(':') == 1:  
+                    # "YYYY-MM-DD HH:MM" → append ":00"  
+                    return time_text + ':00'  
+                else:  
+                    return time_text  
+            else:  
+                return time_text + ' 00:00:00'
+  
+        return time_text  
     except Exception as e:  
-        sv.logger.warning(f"时间格式化失败: {e}，原始时间: {raw_time}")  
-        return raw_time    
+        sv.logger.warning(f"时间格式化失败: {time_text}, 错误: {e}")  
+        return time_text
+        
   
 def load_config():  
     """加载配置文件（带向后兼容）"""  
@@ -119,58 +176,12 @@ headers = {
     'Sec-Fetch-User': '?1',  
     # 移除 X-Requested-With  
 }
+# 启动时从data.json恢复cookie到headers  
+if data.get('cookie'):  
+    headers['Cookie'] = data['cookie']  
+if data.get('xsrf_token'):  
+    headers['X-XSRF-TOKEN'] = data['xsrf_token']
 # -----------------------------------------------------------------------------  
-  
-def format_weibo_time(time_text):  
-    """将微博时间文本标准化为 YYYY-MM-DD HH:MM:SS 格式"""  
-    import re  
-    from datetime import datetime, timedelta  
-      
-    if not time_text or time_text == 'unknown':  
-        return ''  
-      
-    try:  
-        # 处理相对时间（如"3分钟前"、"1小时前"等）  
-        if '分钟前' in time_text:  
-            minutes = int(re.search(r'(\d+)分钟前', time_text).group(1))  
-            dt = datetime.now() - timedelta(minutes=minutes)  
-            return dt.strftime('%Y-%m-%d %H:%M:%S')  
-        elif '小时前' in time_text:  
-            hours = int(re.search(r'(\d+)小时前', time_text).group(1))  
-            dt = datetime.now() - timedelta(hours=hours)  
-            return dt.strftime('%Y-%m-%d %H:%M:%S')  
-        elif '今天' in time_text:  
-            # 格式如"今天 12:30"  
-            time_part = re.search(r'今天 (\d{2}:\d{2})', time_text).group(1)  
-            dt = datetime.now().strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
-            return dt  
-        elif '昨天' in time_text:  
-            # 格式如"昨天 12:30"  
-            time_part = re.search(r'昨天 (\d{2}:\d{2})', time_text).group(1)  
-            dt = datetime.now() - timedelta(days=1)  
-            return dt.strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
-        elif '月' in time_text and '日' in time_text:  
-            # 格式如"12月25日 12:30" 或 "12月25日"  
-            match = re.search(r'(\d{1,2})月(\d{1,2})日(?: (\d{2}:\d{2}))?', time_text)  
-            if match:  
-                month = match.group(1)  
-                day = match.group(2)  
-                time_part = match.group(3) if match.group(3) else '00:00'  
-                year = datetime.now().year  
-                return f'{year}-{month.zfill(2)}-{day.zfill(2)} {time_part}:00'  
-        elif '-' in time_text:  
-            # 格式如"2024-12-25 12:30:00"  
-            if len(time_text.split(' ')) == 2 and ':' in time_text.split(' ')[1]:  
-                return time_text  
-            else:  
-                # 可能只有日期部分  
-                return time_text + ' 00:00:00'  
-          
-        # 如果都不匹配，返回原文本  
-        return time_text  
-    except Exception as e:  
-        sv.logger.warning(f"时间格式化失败: {time_text}, 错误: {e}")  
-        return time_text  
   
 def parse_html_response(html_content):  
     """解析HTML响应，提取微博内容"""  
@@ -398,78 +409,104 @@ async def get_weibo_user_info(uid, retry=2, force_refresh=False):
     return result
     
 async def get_weibo_user_latest_posts(uid, count=5, retry=2):  
-    """获取用户最新微博(HTML抓取版本)"""  
-    global data  # Add this line  
+    """获取用户最新微博(m.weibo.cn API版本)"""  
     all_posts = []  
     page = 1  
     max_pages = 5  
-      
-    # HTML请求头（模拟浏览器）  
-    html_headers = {  
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',  
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',  
-        'Accept-Language': 'zh-CN,zh;q=0.9,ja;q=0.8,zh-TW;q=0.7',  
-        'Accept-Encoding': 'gzip, deflate, br, zstd',  
-        'Cache-Control': 'max-age=0',  
-        'Cookie': data['cookie'],  # This line was causing the error  
-        'Upgrade-Insecure-Requests': '1',  
-        'Sec-Fetch-Dest': 'document',  
-        'Sec-Fetch-Mode': 'navigate',  
-        'Sec-Fetch-Site': 'none',  
-        'Sec-Fetch-User': '?1'  
-    }
-      
+  
     while len(all_posts) < count and page <= max_pages:  
-        url = f'https://weibo.cn/{uid}?page={page}'  
-          
+        url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page={page}'  
+  
         for attempt in range(retry + 1):  
             try:  
-                async with aiohttp.ClientSession(headers=html_headers) as session:  
+                async with aiohttp.ClientSession(headers=headers) as session:  
                     async with session.get(url, timeout=10) as resp:  
                         if resp.status != 200:  
-                            sv.logger.warning(f"微博{uid}页面请求失败(页{page},尝试{attempt+1}/{retry+1}) - 状态码: {resp.status}")  
+                            sv.logger.warning(f"微博{uid}API请求失败(页{page},尝试{attempt+1}/{retry+1}) - 状态码: {resp.status}")  
                             await asyncio.sleep(3)  
                             continue  
-                          
+  
                         content_type = resp.headers.get('Content-Type', '')  
-                        if 'text/html' in content_type:  
-                            # HTML响应处理  
-                            html_content = await resp.text()  
-                            sv.logger.info(f"获取到HTML内容，长度: {len(html_content)}")  
-                            html_posts = parse_html_response(html_content)  
-                            sv.logger.info(f"HTML解析结果: {len(html_posts)}条微博")  
-                            if html_posts:  
-                                all_posts.extend(html_posts)  
-                                if len(all_posts) >= count:  
-                                    return all_posts[:count]  
-                            break  
-                        elif 'application/json' in content_type:  
-                            # JSON响应处理（备用）  
-                            data = await resp.json()  
-                            if data.get('ok') == 1:  
-                                cards = data.get('data', {}).get('cards', [])  
-                                for card in cards:  
-                                    if card.get('card_type') == 9:  
-                                        mblog = card.get('mblog', {})  
-                                        # 原有的JSON解析逻辑...  
-                                        if len(all_posts) >= count:  
-                                            return all_posts  
-                                break  
-                            else:  
-                                sv.logger.warning(f"微博{uid}获取失败(页{page},尝试{attempt+1}/{retry+1}), API返回: {data}")  
-                                await asyncio.sleep(3)  
-                        else:  
-                            sv.logger.warning(f"微博{uid}未知响应格式(页{page},尝试{attempt+1}/{retry+1}) - Content-Type: {content_type}")  
+                        if 'application/json' not in content_type:  
+                            sv.logger.warning(f"微博{uid}API非JSON响应(页{page},尝试{attempt+1}/{retry+1}) - Content-Type: {content_type}")  
                             await asyncio.sleep(3)  
                             continue  
-                              
+  
+                        resp_data = await resp.json()  
+                        if resp_data.get('ok') != 1:  
+                            sv.logger.warning(f"微博{uid}API返回失败(页{page},尝试{attempt+1}/{retry+1}): {resp_data}")  
+                            await asyncio.sleep(3)  
+                            continue  
+  
+                        cards = resp_data.get('data', {}).get('cards', [])  
+                        for card in cards:  
+                            if card.get('card_type') != 9:  
+                                continue  
+                            mblog = card.get('mblog', {})  
+                            if not mblog:  
+                                continue  
+  
+                            # 提取文本（HTML转纯文本）  
+                            raw_text = mblog.get('text', '')  
+                            # 替换<br>为换行  
+                            text = re.sub(r'<br\s*/?>', '\n', raw_text)  
+                            # 去除HTML标签  
+                            text = re.sub(r'<[^>]+>', '', text)  
+                            # 解码HTML实体  
+                            text = html.unescape(text).strip()  
+                            if not text:  
+                                text = '【无正文内容】'  
+  
+                            # 提取图片（优先取large原图）  
+                            pic_urls = []  
+                            pics = mblog.get('pics', [])  
+                            for pic in pics:  
+                                large_url = pic.get('large', {}).get('url', '')  
+                                if large_url:  
+                                    pic_urls.append(large_url)  
+                                else:  
+                                    url_fallback = pic.get('url', '')  
+                                    if url_fallback:  
+                                        pic_urls.append(url_fallback)  
+  
+                            # 提取视频信息  
+                            video_info = {'play_page_url': '', 'cover_url': ''}  
+                            page_info = mblog.get('page_info', {})  
+                            if page_info and page_info.get('type') == 'video':  
+                                media_info = page_info.get('media_info', {})  
+                                video_info['play_page_url'] = media_info.get('stream_url_hd', '') or media_info.get('stream_url', '')  
+                                page_pic = page_info.get('page_pic', {})  
+                                video_info['cover_url'] = page_pic.get('url', '') if isinstance(page_pic, dict) else str(page_pic)  
+  
+                            # 时间处理  
+                            created_at = mblog.get('created_at', 'unknown')  
+                            formatted_time = format_weibo_time(created_at)  
+  
+                            all_posts.append({  
+                                'id': str(mblog.get('id', 'unknown')),  
+                                'text': text,  
+                                'pics': pic_urls,  
+                                'video': video_info,  
+                                'created_at': created_at,  
+                                'created_time': formatted_time,  
+                                'reposts_count': mblog.get('reposts_count', 0),  
+                                'comments_count': mblog.get('comments_count', 0),  
+                                'attitudes_count': mblog.get('attitudes_count', 0)  
+                            })  
+  
+                            if len(all_posts) >= count:  
+                                return all_posts[:count]  
+  
+                        # Successfully processed this page, break retry loop  
+                        break  
+  
             except Exception as e:  
-                sv.logger.error(f"微博{uid}请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")  
+                sv.logger.error(f"微博{uid}API请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")  
                 await asyncio.sleep(3)  
-          
+  
         page += 1  
         await asyncio.sleep(1)  
-      
+  
     return all_posts
 
 
@@ -580,7 +617,7 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
     # 追加统计和链接  
     msg_parts.extend([  
         f"\n👍 {post['attitudes_count']}  🔁 {post['reposts_count']}  💬 {post['comments_count']}",  
-        f"\n发布时间：{post['created_at']}",  
+        f"\n发布时间：{post['created_time']}",
         f"\n原文链接：https://m.weibo.cn/status/{post['id']}",  
         f"\n取消关注请使用：取消关注微博 {uid}"  
     ])  
@@ -596,8 +633,8 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
             sv.logger.error(f"向群{group_id}推送失败: {e}，消息预览: {full_msg[:200]}...")
 
 
-# -------------------------- 定时任务（调整为10分钟减少反爬） --------------------------
-@sv.scheduled_job('interval', minutes=10)
+# -------------------------- 定时任务（调整为15分钟减少反爬） --------------------------
+@sv.scheduled_job('interval', minutes=15)
 async def scheduled_check_weibo():
     await check_and_push_new_weibo()
 
@@ -930,7 +967,7 @@ async def view_weibo(bot, ev: CQEvent):
                 msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')  
           
         msg_parts.append(f'\n👍 {post["attitudes_count"]}  🔁 {post["reposts_count"]}  💬 {post["comments_count"]}')  
-        msg_parts.append(f'\n发布时间: {post["created_at"]}')  
+        msg_parts.append(f'\n发布时间: {post["created_time"]}')
         msg_parts.append(f'\n链接: https://m.weibo.cn/status/{post["id"]}\n\n')  
       
     _nlmt.increase(user_id)  
@@ -990,7 +1027,7 @@ async def get_official_biweekly(bot, ev: CQEvent):
         # 添加统计和链接  
         msg_parts.extend([  
             f"\n👍 {biweekly_post['attitudes_count']}  🔁 {biweekly_post['reposts_count']}  💬 {biweekly_post['comments_count']}",  
-            f"\n发布时间：{biweekly_post['created_at']}",  
+            f"\n发布时间：{biweekly_post['created_time']}",
             f"\n原文链接：https://m.weibo.cn/status/{biweekly_post['id']}"  
         ])  
           
@@ -1025,9 +1062,11 @@ async def update_cookie(bot, ev: CQEvent):
         await bot.finish(ev, '未从Cookie中找到XSRF-TOKEN，请检查Cookie格式是否正确~')
     
     # 更新全局headers
-    global headers
-    headers['Cookie'] = new_cookie
-    headers['X-XSRF-TOKEN'] = xsrf_token
+    global headers, data  
+    headers['Cookie'] = new_cookie  
+    headers['X-XSRF-TOKEN'] = xsrf_token  
+    data['cookie'] = new_cookie  
+    data['xsrf_token'] = xsrf_token
     
     # 保存到数据文件（持久化）
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
