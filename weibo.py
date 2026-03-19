@@ -13,6 +13,10 @@ import requests
 from lxml import etree  
 import time  
 import random  
+from PIL import Image, ImageOps  
+from io import BytesIO  
+import base64  
+import math
   
 sv = Service('微博推送', visible=True, enable_on_default=False, help_='微博推送服务')  
   
@@ -608,6 +612,72 @@ async def check_and_push_new_weibo():
             sv.logger.error(f"处理微博{uid}时出错: {e}")
             continue
 
+async def merge_images_to_grid(pic_urls: list) -> str:  
+    """将多张图片合并为九宫格，返回 CQ:image base64 字符串，失败返回 None"""  
+    try:  
+        pics = pic_urls[:9]  
+        n = len(pics)  
+        if n <= 2:  
+            return None  
+  
+        # 使用专门的图片下载headers（不使用全局API headers）  
+        img_headers = {  
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',  
+            'Referer': 'https://m.weibo.cn/',  
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',  
+        }  
+  
+        images = []  
+        async with aiohttp.ClientSession() as session:  
+            for url in pics:  
+                try:  
+                    async with session.get(url, headers=img_headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as resp:  
+                        sv.logger.info(f"下载图片 {url} 状态码: {resp.status}")  
+                        if resp.status == 200:  
+                            img_data = await resp.read()  
+                            sv.logger.info(f"图片数据大小: {len(img_data)} bytes")  
+                            img = Image.open(BytesIO(img_data))  
+                            img = img.convert('RGB')  # 确保统一为RGB模式  
+                            images.append(img)  
+                        else:  
+                            sv.logger.warning(f"下载图片失败 HTTP {resp.status}: {url}")  
+                except Exception as e:  
+                    sv.logger.warning(f"下载图片异常: {url}, {type(e).__name__}: {e}")  
+  
+        sv.logger.info(f"成功下载 {len(images)}/{len(pics)} 张图片")  
+  
+        if len(images) <= 2:  
+            sv.logger.warning(f"下载成功的图片不足3张({len(images)}张)，放弃合并")  
+            return None  
+  
+        n = len(images)  
+        cols = 3 if n > 2 else n  
+        rows = math.ceil(n / cols)  
+        cell_size = 300  
+        gap = 4  
+        canvas_w = cols * cell_size + (cols - 1) * gap  
+        canvas_h = rows * cell_size + (rows - 1) * gap  
+        canvas = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))  
+  
+        for i, img in enumerate(images):  
+            row_idx = i // cols  
+            col_idx = i % cols  
+            fitted = ImageOps.fit(img, (cell_size, cell_size))  
+            x = col_idx * (cell_size + gap)  
+            y = row_idx * (cell_size + gap)  
+            canvas.paste(fitted, (x, y))  
+  
+        buf = BytesIO()  
+        canvas.save(buf, format='JPEG', quality=85)  
+        b64 = base64.b64encode(buf.getvalue()).decode()  
+        sv.logger.info(f"九宫格合并成功，base64长度: {len(b64)}")  
+        return f"[CQ:image,file=base64://{b64}]"  
+    except Exception as e:  
+        sv.logger.error(f"合并九宫格图片失败: {type(e).__name__}: {e}")  
+        import traceback  
+        sv.logger.error(traceback.format_exc())  
+        return None
+        
 async def push_weibo_to_groups(group_ids, name, uid, post):  
     """推送微博到指定群（优先使用配置文件中的自定义名称）"""  
     # 优先从 group_follows 中获取自定义名称  
@@ -638,10 +708,19 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
         f"{post['text']}\n\n"  
     ]   
       
-    # 追加图片  
-    for pic_url in post['pics']:  
-        if pic_url:  
-            msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+    # 追加图片（多图时合并为九宫格）  
+    if len(post['pics']) > 2:  
+        grid_img = await merge_images_to_grid(post['pics'])  
+        if grid_img:  
+            msg_parts.append(f"{grid_img}\n")  
+        else:  
+            for pic_url in post['pics']:  
+                if pic_url:  
+                    msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+    else:  
+        for pic_url in post['pics']:  
+            if pic_url:  
+                msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
       
     # 追加统计和链接  
     msg_parts.extend([  
@@ -992,10 +1071,19 @@ async def view_weibo(bot, ev: CQEvent):
     for i, post in enumerate(posts, 1):  
         msg_parts.append(f'【{i}】{post["text"][:100]}...\n' if len(post["text"]) > 100 else f'【{i}】{post["text"]}\n')  
           
-        # 添加图片  
-        for pic_url in post['pics'][:3]:  # 每条最多显示3张图  
-            if pic_url:  
-                msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')  
+        # 添加图片（多图时合并为九宫格）  
+        if len(post['pics']) > 2:  
+            grid_img = await merge_images_to_grid(post['pics'])  
+            if grid_img:  
+                msg_parts.append(grid_img)  
+            else:  
+                for pic_url in post['pics'][:3]:  
+                    if pic_url:  
+                        msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')  
+        else:  
+            for pic_url in post['pics']:  
+                if pic_url:  
+                    msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')
           
         msg_parts.append(f'\n👍 {post["attitudes_count"]}  🔁 {post["reposts_count"]}  💬 {post["comments_count"]}')  
         msg_parts.append(f'\n发布时间: {post["created_time"]}')
@@ -1050,10 +1138,19 @@ async def get_official_biweekly(bot, ev: CQEvent):
             f"{biweekly_post['text']}\n\n"  
         ]  
           
-        # 添加图片  
-        for pic_url in biweekly_post['pics']:  
-            if pic_url:  
-                msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+        # 添加图片（多图时合并为九宫格）  
+        if len(biweekly_post['pics']) > 2:  
+            grid_img = await merge_images_to_grid(biweekly_post['pics'])  
+            if grid_img:  
+                msg_parts.append(f"{grid_img}\n")  
+            else:  
+                for pic_url in biweekly_post['pics']:  
+                    if pic_url:  
+                        msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
+        else:  
+            for pic_url in biweekly_post['pics']:  
+                if pic_url:  
+                    msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
           
         # 添加统计和链接  
         msg_parts.extend([  
