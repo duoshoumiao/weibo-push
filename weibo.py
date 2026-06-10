@@ -17,6 +17,13 @@ from PIL import Image, ImageOps
 from io import BytesIO  
 import base64  
 import math
+import hoshino  
+  
+class CookieExpiredError(Exception):  
+    """微博 Cookie 已失效"""  
+    pass  
+  
+_cookie_expired_notified = False
   
 sv = Service('微博推送', visible=True, enable_on_default=False, help_='微博推送服务')  
   
@@ -446,10 +453,9 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                     async with session.get(url, timeout=timeout) as resp:
                         if resp.status != 200:
                             sv.logger.warning(f"微博{uid}API请求失败(页{page},尝试{attempt+1}/{retry+1}) - 状态码: {resp.status}")
-                            if resp.status == 403 or resp.status == 401:
-                                # 风控触发，直接终止重试
-                                sv.logger.error(f"微博{uid}触发风控，状态码{resp.status}，停止请求")
-                                return all_posts
+                            if resp.status in (401, 403, 432):  
+                                sv.logger.error(f"微博{uid}触发风控，状态码{resp.status}，Cookie 可能已失效")  
+                                raise CookieExpiredError(f"HTTP {resp.status}")
                             await asyncio.sleep(3)
                             continue
 
@@ -457,9 +463,9 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                         if 'application/json' not in content_type:
                             # 新增：尝试解析HTML验证码页面，提前终止
                             html_content = await resp.text()
-                            if 'captcha' in html_content or '验证码' in html_content:
-                                sv.logger.error(f"微博{uid}需要验证码，停止请求")
-                                return all_posts
+                            if 'captcha' in html_content or '验证码' in html_content:  
+                                sv.logger.error(f"微博{uid}需要验证码，Cookie 可能已失效")  
+                                raise CookieExpiredError("captcha")
                             sv.logger.warning(f"微博{uid}API非JSON响应(页{page},尝试{attempt+1}/{retry+1}) - Content-Type: {content_type}")
                             await asyncio.sleep(3)
                             continue
@@ -467,9 +473,9 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                         resp_data = await resp.json()
                         if resp_data.get('ok') != 1:
                             # 新增：检测风控返回码
-                            if resp_data.get('ok') == -100:
-                                sv.logger.error(f"微博{uid}触发风控(ok=-100)，停止请求")
-                                return all_posts
+                            if resp_data.get('ok') == -100:  
+                                sv.logger.error(f"微博{uid}触发风控(ok=-100)，Cookie 可能已失效")  
+                                raise CookieExpiredError("ok=-100")
                             sv.logger.warning(f"微博{uid}API返回失败(页{page},尝试{attempt+1}/{retry+1}): {resp_data}")
                             if attempt < retry:
                                 await asyncio.sleep(3)
@@ -534,9 +540,11 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
 
                         break
 
-            except Exception as e:
-                sv.logger.error(f"微博{uid}API请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")
-                if attempt < retry:
+            except CookieExpiredError:  
+                raise  # 直接向上抛，不重试  
+            except Exception as e:  
+                sv.logger.error(f"微博{uid}API请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")  
+                if attempt < retry:  
                     await asyncio.sleep(3)
 
         page += 1
@@ -545,8 +553,9 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     return all_posts
 
 
-async def check_and_push_new_weibo():
-    """检查新微博并推送"""
+async def check_and_push_new_weibo():  
+    """检查新微博并推送"""  
+    global _cookie_expired_notified  
     sv.logger.info("开始检查微博更新...")
     all_followed_uids = set()
     for follows in weibo_config['group_follows'].values():
@@ -608,8 +617,19 @@ async def check_and_push_new_weibo():
                     weibo_config['group_follows'][group_id][uid]['last_post_time'] = current_time
                 save_config()
           
-        except Exception as e:
-            sv.logger.error(f"处理微博{uid}时出错: {e}")
+        except CookieExpiredError as e:  
+            if not _cookie_expired_notified:  
+                _cookie_expired_notified = True  
+                msg = f"[微博推送] 微博 Cookie 已失效（{e}），推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。"  
+                try:  
+                    bot = hoshino.get_bot()  
+                    for superuser_id in hoshino.config.SUPERUSERS:  
+                        await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
+                except Exception as notify_err:  
+                    sv.logger.error(f"通知主人失败: {notify_err}")  
+            break  
+        except Exception as e:  
+            sv.logger.error(f"处理微博{uid}时出错: {e}")  
             continue
 
 async def merge_images_to_grid(pic_urls: list) -> str:  
@@ -1041,9 +1061,9 @@ async def check_blacklist(bot, ev: CQEvent):
         msg += f"- {uid}\n"
     await bot.send(ev, msg)
 
-@sv.on_prefix(('查看微博',))  
+@sv.on_prefix(('查看微博',))    
 async def view_weibo(bot, ev: CQEvent):  
-    user_id = ev.user_id  
+    user_id = ev.user_id    
       
     # 频率限制  
     if not _nlmt.check(user_id):  
@@ -1061,7 +1081,16 @@ async def view_weibo(bot, ev: CQEvent):
         await bot.finish(ev, f'未查询到微博ID为{uid}的用户,请检查ID是否正确~')  
       
     # 获取最新5条微博  
-    posts = await get_weibo_user_latest_posts(uid, count=5)  
+    try:  
+        posts = await get_weibo_user_latest_posts(uid, count=5)  
+    except CookieExpiredError:  
+        msg = '[微博推送] 微博 Cookie 已失效，推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。'  
+        try:  
+            for superuser_id in hoshino.config.SUPERUSERS:  
+                await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
+        except Exception as notify_err:  
+            sv.logger.error(f"通知主人失败: {notify_err}")  
+        return
     if not posts:  
         await bot.finish(ev, f'{user_info["name"]} 暂无微博内容~')  
       
@@ -1114,10 +1143,15 @@ async def get_official_biweekly(bot, ev: CQEvent):
             return  
           
         # 获取最新70条微博(增加数量以提高找到半月刊的概率)  
-        posts = await get_weibo_user_latest_posts(uid, count=70)  
-        if not posts:  
-            await bot.finish(ev, '❌ 无法获取微博内容\n'  
-                              '💡 可能是网络问题或认证失效，建议管理员检查配置')  
+        try:  
+            posts = await get_weibo_user_latest_posts(uid, count=70)  
+        except CookieExpiredError:  
+            msg = '[微博推送] 微博 Cookie 已失效，推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。'  
+            try:  
+                for superuser_id in hoshino.config.SUPERUSERS:  
+                    await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
+            except Exception as notify_err:  
+                sv.logger.error(f"通知主人失败: {notify_err}")  
             return  
           
         # 查找包含"活动半月刊"的微博  
@@ -1199,6 +1233,10 @@ async def update_weibo_cookie(bot, ev: CQEvent):
     if xsrf_token:
         headers['X-XSRF-TOKEN'] = xsrf_token
     
+    # 重置 Cookie 失效通知标志，下次失效时可再次通知  
+    global _cookie_expired_notified  
+    _cookie_expired_notified = False  
+      
     await bot.send(ev, f'Cookie更新成功！\nXSRF-TOKEN: {xsrf_token}\n请测试微博功能是否恢复。')
        
 # 主动检查微博更新  
