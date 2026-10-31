@@ -741,6 +741,82 @@ async def get_weibo_user_info(uid, retry=2, force_refresh=False):
     return None
 
     
+# ---------------------- 视频信息提取 ----------------------
+# m.weibo.cn 的视频微博：正文照旧，视频信息在 mblog['page_info']，封面在
+# page_info['page_pic']['url']（形如 .../orj480/xxxx.jpg）。注意视频微博的
+# mblog['pics'] 通常是空的 —— 不专门取封面的话，推送里一张图都不会有。
+_COVER_SMALL_SEG_RE = re.compile(
+    r'/(?:orj\d+|wap\d+|thumb\d+|thumbnail|small|bmiddle|crop\.[\d.]+)/', re.I)
+
+
+def _upgrade_cover_url(url: str) -> str:
+    """把封面小图换到 mw2000 档位（与普通图片微博用的尺寸一致）
+
+    实测 /mw2000/ 与 /large/ 都是同一 pid 的合法尺寸段，只改尺寸段、不动 pid；
+    已经是 mw*/large 的原样返回。
+    """
+    if not url:
+        return ''
+    if url.startswith('//'):
+        url = 'https:' + url
+    return _COVER_SMALL_SEG_RE.sub('/mw2000/', url, count=1)
+
+
+def _format_duration(value) -> str:
+    """media_info.duration（秒，可能是字符串）-> 03:58"""
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return ''
+    if seconds <= 0:
+        return ''
+    return f'{seconds // 60:02d}:{seconds % 60:02d}'
+
+
+def _extract_video_info(mblog: dict) -> dict:
+    """提取视频信息（也认「转发微博」里的视频）；非视频返回同结构的空值"""
+    info = {
+        'is_video': False,
+        'cover_url': '',
+        'cover_raw': '',
+        'play_page_url': '',
+        'share_url': '',
+        'title': '',
+        'duration_text': '',
+        'play_count': '',
+        'from_retweet': False,
+    }
+    for holder, from_retweet in ((mblog, False), (mblog.get('retweeted_status') or {}, True)):
+        page_info = holder.get('page_info')
+        if not isinstance(page_info, dict) or page_info.get('type') != 'video':
+            continue
+        media_info = page_info.get('media_info') or {}
+        page_pic = page_info.get('page_pic')
+        if isinstance(page_pic, dict):
+            cover = page_pic.get('url') or ''
+        else:
+            cover = str(page_pic or '')
+        if not cover:
+            # 兜底：个别视频把封面塞在 pics / thumbnail_pic 里
+            pics = holder.get('pics') or []
+            if pics:
+                first = pics[0] or {}
+                cover = (first.get('large') or {}).get('url') or first.get('url') or ''
+            cover = cover or (holder.get('thumbnail_pic') or '')
+        info.update({
+            'is_video': True,
+            'cover_url': _upgrade_cover_url(cover),
+            'cover_raw': cover,
+            'play_page_url': (media_info.get('stream_url_hd')
+                              or media_info.get('stream_url') or ''),
+            'share_url': page_info.get('page_url') or '',
+            'title': str(page_info.get('title') or '').strip(),
+            'duration_text': _format_duration(media_info.get('duration')),
+            'play_count': str(page_info.get('play_count') or '').strip(),
+            'from_retweet': from_retweet,
+        })
+        return info
+    return info
 async def get_weibo_user_latest_posts(uid, count=5, retry=2):
     """获取用户最新微博（m.weibo.cn API）
 
@@ -795,14 +871,8 @@ async def get_weibo_user_latest_posts(uid, count=5, retry=2):
                 elif pic.get('url'):
                     pic_urls.append(pic['url'])
 
-            video_info = {'play_page_url': '', 'cover_url': ''}
-            page_info = mblog.get('page_info') or {}
-            if page_info and page_info.get('type') == 'video':
-                media_info = page_info.get('media_info') or {}
-                video_info['play_page_url'] = (media_info.get('stream_url_hd', '')
-                                               or media_info.get('stream_url', ''))
-                page_pic = page_info.get('page_pic')
-                video_info['cover_url'] = (page_pic or {}).get('url', '') if isinstance(page_pic, dict) else str(page_pic or '')
+            # 视频信息（含转发微博里的视频与封面）
+            video_info = _extract_video_info(mblog)
 
             created_at = mblog.get('created_at', 'unknown')
             all_posts.append({
@@ -1000,6 +1070,44 @@ async def merge_images_to_grid(pic_urls: list) -> str:
         return None
 
         
+async def build_post_media_parts(post: dict, fallback_max=None) -> list:
+    """按「视频封面 -> 图片」生成媒体片段（推送 / 查看微博 / 半月刊 共用）
+
+    - 视频微博：先发封面，再发图片（如果有），并带上时长/播放量/视频地址；
+      转发过来的视频会标注「转发」。
+    - 多图仍然合并九宫格；合并失败时最多退回 fallback_max 张（None 表示不限）。
+    """
+    parts = []
+    video = post.get('video') or {}
+    cover = video.get('cover_url') or ''
+
+    if video.get('is_video'):
+        label = '▶️ 视频'
+        if video.get('duration_text'):
+            label += f" {video['duration_text']}"
+        metas = [x for x in (video.get('play_count'),
+                             '转发' if video.get('from_retweet') else '') if x]
+        if metas:
+            label += ' · ' + ' · '.join(metas)
+        parts.append(f"{label}\n")
+        if cover:
+            parts.append(f"[CQ:image,url={escape(cover)}]\n")
+        if video.get('share_url'):
+            parts.append(f"视频地址：{video['share_url']}\n")
+
+    pics = [p for p in (post.get('pics') or []) if p]
+    if cover:
+        pics = [p for p in pics if p != cover]      # 封面上面已经发过，别重复
+    if len(pics) > 2:
+        grid_img = await merge_images_to_grid(pics)
+        if grid_img:
+            parts.append(f"{grid_img}\n")
+            pics = []
+        elif fallback_max:
+            pics = pics[:fallback_max]
+    for pic_url in pics:
+        parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
+    return parts
 async def push_weibo_to_groups(group_ids, name, uid, post):  
     """推送微博到指定群（优先使用配置文件中的自定义名称）"""  
     # 优先从 group_follows 中获取自定义名称  
@@ -1030,19 +1138,8 @@ async def push_weibo_to_groups(group_ids, name, uid, post):
         f"{post['text']}\n\n"  
     ]   
       
-    # 追加图片（多图时合并为九宫格）  
-    if len(post['pics']) > 2:  
-        grid_img = await merge_images_to_grid(post['pics'])  
-        if grid_img:  
-            msg_parts.append(f"{grid_img}\n")  
-        else:  
-            for pic_url in post['pics']:  
-                if pic_url:  
-                    msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
-    else:  
-        for pic_url in post['pics']:  
-            if pic_url:  
-                msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
+    # 追加媒体：视频封面优先，图片（多图合并九宫格）在后
+    msg_parts.extend(await build_post_media_parts(post))
       
     # 追加统计和链接  
     msg_parts.extend([  
@@ -1403,19 +1500,8 @@ async def view_weibo(bot, ev: CQEvent):
     for i, post in enumerate(posts, 1):  
         msg_parts.append(f'【{i}】{post["text"][:100]}...\n' if len(post["text"]) > 100 else f'【{i}】{post["text"]}\n')  
           
-        # 添加图片（多图时合并为九宫格）  
-        if len(post['pics']) > 2:  
-            grid_img = await merge_images_to_grid(post['pics'])  
-            if grid_img:  
-                msg_parts.append(grid_img)  
-            else:  
-                for pic_url in post['pics'][:3]:  
-                    if pic_url:  
-                        msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')  
-        else:  
-            for pic_url in post['pics']:  
-                if pic_url:  
-                    msg_parts.append(f'[CQ:image,url={escape(pic_url)}]')
+        # 视频封面 + 图片（统一走公共逻辑）
+        msg_parts.extend(await build_post_media_parts(post, fallback_max=3))
           
         msg_parts.append(f'\n👍 {post["attitudes_count"]}  🔁 {post["reposts_count"]}  💬 {post["comments_count"]}')  
         msg_parts.append(f'\n发布时间: {post["created_time"]}')
@@ -1474,19 +1560,8 @@ async def get_official_biweekly(bot, ev: CQEvent):
             f"{biweekly_post['text']}\n\n"  
         ]  
           
-        # 添加图片（多图时合并为九宫格）  
-        if len(biweekly_post['pics']) > 2:  
-            grid_img = await merge_images_to_grid(biweekly_post['pics'])  
-            if grid_img:  
-                msg_parts.append(f"{grid_img}\n")  
-            else:  
-                for pic_url in biweekly_post['pics']:  
-                    if pic_url:  
-                        msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")  
-        else:  
-            for pic_url in biweekly_post['pics']:  
-                if pic_url:  
-                    msg_parts.append(f"[CQ:image,url={escape(pic_url)}]\n")
+        # 视频封面 + 图片（统一走公共逻辑）
+        msg_parts.extend(await build_post_media_parts(biweekly_post))
           
         # 添加统计和链接  
         msg_parts.extend([  
