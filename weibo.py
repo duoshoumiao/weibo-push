@@ -1,28 +1,36 @@
-from hoshino import Service, priv  
-from hoshino.typing import CQEvent  
-from hoshino.util import DailyNumberLimiter, FreqLimiter, escape    
-import json  
-import os  
-import asyncio  
-import aiohttp  
-import re  
-import html  
-from datetime import datetime    
-from nonebot import on_startup  
-import requests  
-from lxml import etree  
-import time  
-import random  
-from PIL import Image, ImageOps  
-from io import BytesIO  
-import base64  
+from hoshino import Service, priv
+from hoshino.typing import CQEvent
+from hoshino.util import DailyNumberLimiter, FreqLimiter, escape
+import json
+import os
+import asyncio
+import aiohttp
+import re
+import html
+import random
+import time
 import math
-import hoshino  
-  
-class CookieExpiredError(Exception):  
-    """微博 Cookie 已失效"""  
-    pass  
-  
+import base64
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
+from PIL import Image, ImageOps
+import hoshino
+
+
+class WeiboAuthError(Exception):
+    """微博认证类错误基类"""
+
+
+class CookieExpiredError(WeiboAuthError):
+    """微博 Cookie 已失效，且自动续期失败"""
+
+
+class LoginRequiredError(WeiboAuthError):
+    """该接口需要真实登录，游客身份不可用"""
+
+
 _cookie_expired_notified = False
   
 sv = Service('微博推送', visible=True, enable_on_default=False, help_='微博推送服务')  
@@ -44,565 +52,861 @@ weibo_config = {
     'group_blacklist': {}     # {group_id: set(weibo_id)} 群独立黑名单  
 } 
   
-def format_weibo_time(time_text):  
-    """将微博时间文本标准化为 YYYY-MM-DD HH:MM:SS 格式"""  
-    import re  
-    from datetime import datetime, timedelta  
-  
-    if not time_text or time_text == 'unknown':  
-        return ''  
-  
-    try:  
-        # 处理API格式（如 "Sun Mar 09 12:00:00 +0800 2026"）  
-        try:  
-            dt = datetime.strptime(time_text, '%a %b %d %H:%M:%S %z %Y')  
-            return dt.strftime('%Y-%m-%d %H:%M:%S')  
-        except (ValueError, AttributeError):  
-            pass  
-          
-        # 处理 "YYYY-MM-DD HH:MM" 格式（无秒）  
-        if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', time_text):  
-            return time_text + ':00'  
-          
-        # (keep all existing branches below: 分钟前, 小时前, 今天, 昨天, 月/日, etc.)
-  
-        # 处理相对时间（如"3分钟前"、"1小时前"等）  
-        if '分钟前' in time_text:  
-            minutes = int(re.search(r'(\d+)分钟前', time_text).group(1))  
-            dt = datetime.now() - timedelta(minutes=minutes)  
-            return dt.strftime('%Y-%m-%d %H:%M:%S')  
-        elif '小时前' in time_text:  
-            hours = int(re.search(r'(\d+)小时前', time_text).group(1))  
-            dt = datetime.now() - timedelta(hours=hours)  
-            return dt.strftime('%Y-%m-%d %H:%M:%S')  
-        elif '今天' in time_text:  
-            time_part = re.search(r'今天 (\d{2}:\d{2})', time_text).group(1)  
-            dt = datetime.now().strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
-            return dt  
-        elif '昨天' in time_text:  
-            time_part = re.search(r'昨天 (\d{2}:\d{2})', time_text).group(1)  
-            dt = datetime.now() - timedelta(days=1)  
-            return dt.strftime('%Y-%m-%d') + ' ' + time_part + ':00'  
-        elif '月' in time_text and '日' in time_text:  
-            match = re.search(r'(\d{1,2})月(\d{1,2})日(?: (\d{2}:\d{2}))?', time_text)  
-            if match:  
-                month = match.group(1)  
-                day = match.group(2)  
-                time_part = match.group(3) if match.group(3) else '00:00'  
-                year = datetime.now().year  
-                return f'{year}-{month.zfill(2)}-{day.zfill(2)} {time_part}:00'  
-        elif '-' in time_text:  
-            # 格式如"2024-12-25 12:30:00" 或 "2024-12-25 12:30" 或 "2024-12-25"  
-            parts = time_text.split(' ')  
-            if len(parts) == 2 and ':' in parts[1]:  
-                time_part = parts[1]  
-                if time_part.count(':') == 1:  
-                    # "YYYY-MM-DD HH:MM" → append ":00"  
-                    return time_text + ':00'  
-                else:  
-                    return time_text  
-            else:  
-                return time_text + ' 00:00:00'
-  
-        return time_text  
-    except Exception as e:  
-        sv.logger.warning(f"时间格式化失败: {time_text}, 错误: {e}")  
-        return time_text
+def _resolve_month_day(now, month, day, hour, minute):
+    """由月/日推断年份：默认今年；若算出未来时间超过 1 天，则视为去年（跨年场景）"""
+    for year in (now.year, now.year - 1):
+        try:
+            dt = datetime(year, month, day, hour, int(minute))
+        except ValueError:
+            return ''
+        if dt - now <= timedelta(days=1):
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+    return ''
+
+
+def format_weibo_time(time_text):
+    """把微博时间文本标准化为本地时间 YYYY-MM-DD HH:MM:SS
+
+    m.weibo.cn 的 created_at 有多种形态：
+      "Thu Oct 31 11:03:09 +0800 2026"（API 原始格式，最常见）
+      "刚刚" / "3分钟前" / "1小时前" / "今天 10:30" / "昨天 10:30"
+      "10-30" / "10-30 10:30"（24 小时以前的微博）
+      "10月30日 10:30" / "2026-10-30 10:30:00"
+    统一转成绝对时间用于比较；实在解析不了返回空串（绝不返回原文本，
+    否则会污染 last_post_time 的字符串比较）。
+    """
+    if not time_text:
+        return ''
+    text = str(time_text).strip()
+    if text in ('unknown', '未知', 'Invalid Date', 'None'):
+        return ''
+
+    now = datetime.now()
+    try:
+        # API 原始格式：Thu Oct 31 11:03:09 +0800 2026
+        try:
+            dt = datetime.strptime(text, '%a %b %d %H:%M:%S %z %Y')
+            return dt.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, AttributeError):
+            pass
+
+        # 绝对时间：YYYY-MM-DD[ HH:MM[:SS]]
+        m = re.match(r'^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$', text)
+        if m:
+            return (f"{m.group(1)}-{m.group(2)}-{m.group(3)} "
+                    f"{m.group(4) or '00'}:{m.group(5) or '00'}:{m.group(6) or '00'}")
+
+        # 刚刚 / X秒前
+        if text.startswith('刚刚'):
+            return now.strftime('%Y-%m-%d %H:%M:%S')
+        m = re.search(r'(\d+)\s*秒前', text)
+        if m:
+            return (now - timedelta(seconds=int(m.group(1)))).strftime('%Y-%m-%d %H:%M:%S')
+
+        # X分钟前 / X小时前
+        m = re.search(r'(\d+)\s*分钟前', text)
+        if m:
+            return (now - timedelta(minutes=int(m.group(1)))).strftime('%Y-%m-%d %H:%M:%S')
+        m = re.search(r'(\d+)\s*小时前', text)
+        if m:
+            return (now - timedelta(hours=int(m.group(1)))).strftime('%Y-%m-%d %H:%M:%S')
+
+        # 今天 HH:MM / 昨天 HH:MM
+        m = re.search(r'今天\s*(\d{1,2}):(\d{2})', text)
+        if m:
+            return f"{now.strftime('%Y-%m-%d')} {int(m.group(1)):02d}:{m.group(2)}:00"
+        m = re.search(r'昨天\s*(\d{1,2}):(\d{2})', text)
+        if m:
+            day = now - timedelta(days=1)
+            return f"{day.strftime('%Y-%m-%d')} {int(m.group(1)):02d}:{m.group(2)}:00"
+
+        # M月D日 [HH:MM]
+        m = re.search(r'(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?', text)
+        if m:
+            return _resolve_month_day(now, int(m.group(1)), int(m.group(2)),
+                                      int(m.group(3) or 0), m.group(4) or '00')
+
+        # MM-DD [HH:MM]（旧版本里这类时间会被当成 "10-30 00:00:00"，
+        # 字符串比较永远小于 "2026-..."，导致跨天补推彻底失效）
+        m = re.match(r'^(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$', text)
+        if m:
+            return _resolve_month_day(now, int(m.group(1)), int(m.group(2)),
+                                      int(m.group(3) or 0), m.group(4) or '00')
+    except Exception as e:
+        sv.logger.warning(f"时间格式化失败: {time_text}, 错误: {e}")
+    return ''
+
+
         
   
-def load_config():  
-    """加载配置文件（带向后兼容）"""  
-    global weibo_config  
-    if os.path.exists(CONFIG_PATH):  
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:  
-            loaded_config = json.load(f)  
-              
-            # 加载基础配置  
-            for key in ['group_follows', 'group_enable', 'account_cache']:  
-                weibo_config[key] = loaded_config.get(key, {})  
-              
-            # 迁移：将last_post_id转换为last_post_time  
-            for group_id, follows in weibo_config['group_follows'].items():  
-                for uid, info in follows.items():  
-                    if 'last_post_id' in info and 'last_post_time' not in info:  
-                        # 旧版本，需要迁移  
-                        info['last_post_time'] = ''  # 重置为空，会重新获取  
-                        del info['last_post_id']  
-              
-            # 加载群黑名单  
-            weibo_config['group_blacklist'] = {}  
-            for group_id, uids in loaded_config.get('group_blacklist', {}).items():  
-                weibo_config['group_blacklist'][group_id] = set(uids)  
-    else:  
-        save_config()  
+def _atomic_write_json(path: str, payload) -> None:
+    """原子写 JSON：先写临时文件再替换，避免写一半崩溃把文件写坏"""
+    tmp_path = f'{path}.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _load_json_file(path: str, default):
+    """读取 JSON；损坏时先备份原文件再返回默认值（绝不静默清空数据）"""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        return loaded if isinstance(loaded, dict) else default
+    except Exception as e:
+        backup = f'{path}.bad-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+        try:
+            os.replace(path, backup)
+            sv.logger.error(f"数据文件损坏({e})，已备份为 {backup}")
+        except Exception:
+            sv.logger.error(f"数据文件损坏({e})，且备份失败")
+        return default
+
+
+def load_config():
+    """加载配置文件（带向后兼容）"""
+    global weibo_config
+    loaded_config = _load_json_file(CONFIG_PATH, None)
+    if loaded_config is None:
+        save_config()
+        return
+
+    for key in ['group_follows', 'group_enable', 'account_cache']:
+        weibo_config[key] = loaded_config.get(key) or {}
+
+    # 迁移：把旧版的 last_post_id 换成 last_post_time
+    for follows in weibo_config['group_follows'].values():
+        for info in follows.values():
+            if 'last_post_id' in info and 'last_post_time' not in info:
+                info['last_post_time'] = ''
+                del info['last_post_id']
+
+    weibo_config['group_blacklist'] = {}
+    for group_id, uids in (loaded_config.get('group_blacklist') or {}).items():
+        weibo_config['group_blacklist'][group_id] = set(uids)
+
+
+def save_config():
+    """保存配置文件（集合转列表以便 JSON 序列化，并原子落盘）"""
+    config_to_save = dict(weibo_config)
+    config_to_save['group_blacklist'] = {
+        group_id: sorted(uids) for group_id, uids in weibo_config['group_blacklist'].items()
+    }
+    try:
+        _atomic_write_json(CONFIG_PATH, config_to_save)
+    except Exception as e:
+        sv.logger.error(f"保存配置失败: {e}")
+
+
   
-def save_config():  
-    """保存配置文件（集合转列表适配JSON序列化）"""  
-    config_to_save = weibo_config.copy()  
-    config_to_save['group_blacklist'] = {  
-        group_id: list(uids) for group_id, uids in weibo_config['group_blacklist'].items()  
-    }  
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:  
-        json.dump(config_to_save, f, ensure_ascii=False, indent=2)  
-  
-# 初始化数据文件和headers  
-def init_data():  
-    # 确保数据文件存在  
-    if not os.path.exists(DATA_FILE):  
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:  
-            json.dump({  
-                'cookie': '',  
-                'xsrf_token': ''  
-            }, f, ensure_ascii=False, indent=2)  
-        return {'cookie': '', 'xsrf_token': ''}  
-      
-    # 读取现有数据  
-    try:  
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:  
-            return json.load(f)  
-    except:  
-        # 数据文件损坏时重建  
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:  
-            json.dump({  
-                'cookie': '',  
-                'xsrf_token': ''  
-            }, f, ensure_ascii=False, indent=2)  
-        return {'cookie': '', 'xsrf_token': ''}  
-  
-# 初始化数据  
-data = init_data()  
-# 初始化配置  
-load_config()  
-# -------------------------- 关键修复：补充完整请求头 --------------------------  
-# 1. 打开 https://m.weibo.cn/ 登录账号  
-# 2. F12打开开发者工具 → Network标签 → 刷新页面 → 选任意getIndex请求  
-# 3. 从Request Headers复制Cookie，提取XSRF-TOKEN值（Cookie中XSRF-TOKEN=xxx的xxx部分）  
-headers = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+# ============================================================================
+# Cookie 生命周期管理
+# ----------------------------------------------------------------------------
+# 问题：m.weibo.cn 的 getIndex 接口必须有 .weibo.cn 域的 SUB Cookie；从浏览器
+#       手工复制的登录 Cookie 通常 7 天左右就失效，需要人工重新复制，很折腾。
+#
+# 方案：
+#   1) 自动申请「游客身份」Cookie —— 走新浪 h5 官方访客流程
+#      (genvisitor2 + crossdomain)，不需要账号密码，签发的是 .weibo.cn 域 SUB，
+#      有效期约一年，失效后随时可以重新申请。默认走这条路，基本无需人工干预。
+#   2) 手工 Cookie 依然支持且优先使用（它能翻更多页），一旦失效自动降级到游客
+#      身份并记录状态，机器人不会因为 Cookie 过期而停摆。
+#   3) 每次响应里的 Set-Cookie 都滚动合并回本地（SUB/_T_WM/XSRF-TOKEN 等），
+#      保持身份新鲜，降低被风控的概率。
+# ============================================================================
+
+API_BASE = 'https://m.weibo.cn'
+_VISITOR_HOME = 'https://visitor.passport.weibo.cn'
+_VISITOR_ENTRY = 'sinawap'
+_VISITOR_VER = '20250916'
+_MOBILE_UA = ('Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
+# 只接受这些域下的 Cookie：新浪在 .weibo.com 域签发的 SUB 会被 m.weibo.cn
+# 主动删除并跳登录页，混进 Cookie 头只会帮倒忙。
+_CN_COOKIE_DOMAINS = ('.weibo.cn', 'weibo.cn', 'm.weibo.cn', '.m.weibo.cn')
+_COOKIE_ATTRS = {'path', 'domain', 'expires', 'max-age', 'samesite', 'secure',
+                 'httponly', 'priority', 'comment', 'version'}
+
+_BASE_HEADERS = {
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Cache-Control': 'max-age=0',
-    'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Android 13; Mobile; rv:109.0) Gecko/115.0 Firefox/115.0',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
+    'User-Agent': _MOBILE_UA,
     'Connection': 'keep-alive',
-    # 保留原有Cookie/XSRF-TOKEN逻辑
 }
-# 启动时从data.json恢复cookie到headers  
-if data.get('cookie'):  
-    headers['Cookie'] = data['cookie']  
-if data.get('xsrf_token'):  
-    headers['X-XSRF-TOKEN'] = data['xsrf_token']
-# -----------------------------------------------------------------------------  
+
+_session = None
+_session_loop = None
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    """全局复用的 aiohttp 会话：连接池复用，不再每个请求重新握手"""
+    global _session, _session_loop
+    loop = asyncio.get_event_loop()
+    if _session is None or _session.closed or _session_loop is not loop:
+        _session = aiohttp.ClientSession(
+            headers=_BASE_HEADERS,
+            cookie_jar=aiohttp.DummyCookieJar(),  # Cookie 全部自己管，行为可预期
+            connector=aiohttp.TCPConnector(limit=16, ttl_dns_cache=600),
+        )
+        _session_loop = loop
+    return _session
+
+
+def _now_str() -> str:
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+_MONTH_MAP = {name: idx for idx, name in enumerate(
+    ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+     'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], start=1)}
+# 新浪的 Set-Cookie 用的是非标准日期："Sunday, 31-Oct-2027 03:04:33 GMT"
+# （日-月-年用连字符），email.utils 解析不了，需要自己兜底。
+_HTTP_DATE_RE = re.compile(r'(\d{1,2})[- ]([A-Za-z]{3})[a-z]*[- ](\d{4})\D+(\d{1,2}):(\d{2}):(\d{2})')
+
+
+def _parse_http_date(value: str):
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except Exception:
+        pass
+    m = _HTTP_DATE_RE.search(value)
+    if not m:
+        return None
+    day, mon, year, hour, minute, second = m.groups()
+    month = _MONTH_MAP.get(mon.lower())
+    if not month:
+        return None
+    try:
+        return datetime(int(year), month, int(day), int(hour), int(minute), int(second),
+                        tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _to_local_str(value: str) -> str:
+    dt = _parse_http_date(value)
+    return dt.astimezone().strftime('%Y-%m-%d %H:%M:%S') if dt else ''
+
+
+def normalize_cookie_text(text: str) -> str:
+    """把从浏览器/聊天窗口复制来的 Cookie 文本整理成标准串"""
+    if not text:
+        return ''
+    text = text.replace('\r', ';').replace('\n', ';')
+    text = re.sub(r'^\s*cookie\s*:\s*', '', text.strip(), flags=re.I)
+    return text.strip()
+
+
+def parse_cookie_text(text: str) -> dict:
+    """解析 Cookie 字符串为 {name: value}"""
+    cookies = {}
+    for part in normalize_cookie_text(text).split(';'):
+        part = part.strip()
+        if not part or '=' not in part:
+            continue
+        name, _, value = part.partition('=')
+        name = name.strip()
+        value = value.strip().strip('"')
+        if not name or name.lower() in _COOKIE_ATTRS:
+            continue
+        cookies[name] = value
+    return cookies
+
+
+def _parse_set_cookie_header(raw):
+    """解析单条 Set-Cookie 头
+
+    不用 http.cookies.SimpleCookie：新浪下发的是
+    "expires=Sunday, 31-Oct-2027 03:04:33 GMT" 这种非标准日期（完整星期名 +
+    连字符日期），SimpleCookie 的正则匹配不上会「整条静默丢弃」，既不报错也拿
+    不到值 —— 这就是游客 Cookie 到期时间一直是未知的原因。
+    """
+    parts = raw.split(';')
+    name, _, value = parts[0].partition('=')
+    name = name.strip()
+    if not name:
+        return None, None, {}
+    attrs = {}
+    for item in parts[1:]:
+        key, _, val = item.partition('=')
+        key = key.strip().lower()
+        if key:
+            attrs[key] = val.strip()
+    return name, value.strip(), attrs
+
+
+def split_set_cookie(raw_headers):
+    """解析 Set-Cookie 列表，返回 ({name: value}, {name: 本地过期时间})"""
+    cookies, expires = {}, {}
+    for raw in raw_headers or []:
+        name, value, attrs = _parse_set_cookie_header(raw)
+        if not name:
+            continue
+        domain = (attrs.get('domain') or '').lower()
+        if domain and domain not in _CN_COOKIE_DOMAINS:
+            continue
+        if not value or value == 'deleted' or len(value) > 1024:
+            continue
+        try:
+            max_age = int(attrs['max-age']) if 'max-age' in attrs else None
+        except ValueError:
+            max_age = None
+        if max_age is not None and max_age <= 0:
+            continue
+        cookies[name] = value
+        local = _to_local_str(attrs.get('expires'))
+        if local:
+            expires[name] = local
+        elif max_age:
+            expires[name] = (datetime.now() + timedelta(seconds=max_age)).strftime('%Y-%m-%d %H:%M:%S')
+    return cookies, expires
+
+
+def render_cookie(cookies: dict) -> str:
+    return '; '.join(f'{k}={v}' for k, v in cookies.items() if v)
+
+
+async def request_guest_cookie():
+    """申请 .weibo.cn 域的游客身份 Cookie（新浪 h5 访客流程，无需账号密码）
+
+    返回 (cookies, expires)；失败返回 None。
+    """
+    session = await _get_session()
+    target = 'https://m.weibo.cn/'
+    rid = str(int(time.time() * 1000))
+    payload = {
+        'cb': 'visitor_gray_callback',
+        'ver': _VISITOR_VER,
+        'request_id': f'wbmon{rid}',
+        'tid': '',
+        'from': 'weibo',
+        'webdriver': 'false',
+        'rid': rid,
+        'return_url': target,
+    }
+    try:
+        async with session.post(
+            f'{_VISITOR_HOME}/visitor/genvisitor2',
+            data=payload,
+            headers={'Referer': f'{_VISITOR_HOME}/visitor/visitor?entry={_VISITOR_ENTRY}&a=enter'},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            text = await resp.text()
+    except Exception as e:
+        sv.logger.error(f"申请游客身份失败(genvisitor2): {type(e).__name__}: {e}")
+        return None
+
+    sub = re.search(r'"sub":"([^"]+)"', text)
+    subp = re.search(r'"subp":"([^"]+)"', text)
+    if not sub or not subp:
+        sv.logger.error(f"申请游客身份响应异常: {text[:200]}")
+        return None
+
+    url = (f'{_VISITOR_HOME}/visitor/visitor?a=crossdomain'
+           f'&s={quote(sub.group(1), safe="")}&sp={quote(subp.group(1), safe="")}'
+           f'&from=weibo&_rand={random.random()}&entry={_VISITOR_ENTRY}'
+           f'&url={quote(target, safe="")}')
+    try:
+        async with session.get(url, allow_redirects=False,
+                               headers={'Referer': target},
+                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            raw_cookies = resp.headers.getall('Set-Cookie', [])
+    except Exception as e:
+        sv.logger.error(f"申请游客身份失败(crossdomain): {type(e).__name__}: {e}")
+        return None
+
+    cookies, expires = split_set_cookie(raw_cookies)
+    # crossdomain 没直接下发时，退回 genvisitor2 返回的 sub/subp
+    cookies.setdefault('SUB', sub.group(1))
+    cookies.setdefault('SUBP', subp.group(1))
+    return cookies, expires
+
+
+class CookieStore:
+    """m.weibo.cn 的 Cookie 仓库：手工 Cookie 优先，游客 Cookie 自动兜底"""
+
+    def __init__(self, raw=None):
+        raw = raw or {}
+        self.manual_raw = str(raw.get('cookie') or '')
+        self.manual_cookies = parse_cookie_text(self.manual_raw)
+        self.manual_xsrf = str(raw.get('xsrf_token') or '')
+        self.manual_invalid = bool(raw.get('manual_invalid'))
+        self.manual_expire_at = str(raw.get('manual_expire_at') or '')
+        self.guest = dict(raw.get('guest_cookies') or {})
+        self.guest_xsrf = str(raw.get('guest_xsrf') or '')
+        self.guest_fetched_at = str(raw.get('guest_fetched_at') or '')
+        self.guest_expire_at = str(raw.get('guest_expire_at') or '')
+        self._last_save = 0.0
+
+    # ---------------- 持久化 ----------------
+    def manual_header(self) -> str:
+        if self.manual_cookies:
+            return render_cookie(self.manual_cookies)
+        return self.manual_raw
+
+    def to_dict(self) -> dict:
+        return {
+            'cookie': self.manual_header(),
+            'xsrf_token': self.manual_xsrf,
+            'manual_invalid': self.manual_invalid,
+            'manual_expire_at': self.manual_expire_at,
+            'guest_cookies': self.guest,
+            'guest_xsrf': self.guest_xsrf,
+            'guest_fetched_at': self.guest_fetched_at,
+            'guest_expire_at': self.guest_expire_at,
+        }
+
+    def save(self, force: bool = False) -> None:
+        """写回 data.json；非强制时 10 秒内合并一次，避免频繁落盘"""
+        now = time.time()
+        if not force and now - self._last_save < 10:
+            return
+        self._last_save = now
+        try:
+            _atomic_write_json(DATA_FILE, self.to_dict())
+        except Exception as e:
+            sv.logger.error(f"保存 Cookie 失败: {e}")
+
+    # ---------------- 状态查询 ----------------
+    @property
+    def has_manual(self) -> bool:
+        return bool(self.manual_header()) and not self.manual_invalid
+
+    def source(self) -> str:
+        if self.has_manual:
+            return '手工 Cookie'
+        if self.guest:
+            return '自动游客 Cookie'
+        return '无'
+
+    def cookie_header(self) -> str:
+        if self.has_manual:
+            return self.manual_header()
+        return render_cookie(self.guest)
+
+    def xsrf(self) -> str:
+        if self.has_manual and self.manual_xsrf:
+            return self.manual_xsrf
+        return self.guest_xsrf
+
+    def active_expire_at(self) -> str:
+        return self.manual_expire_at if self.has_manual else self.guest_expire_at
+
+    @staticmethod
+    def _days_left_at(value: str):
+        if not value:
+            return None
+        try:
+            expire = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+        return (expire - datetime.now()).total_seconds() / 86400.0
+
+    def days_left(self):
+        return self._days_left_at(self.active_expire_at())
+
+    def manual_days_left(self):
+        return self._days_left_at(self.manual_expire_at)
+
+    def guest_days_left(self):
+        return self._days_left_at(self.guest_expire_at)
+
+    # ---------------- 变更操作 ----------------
+    def set_manual(self, text: str) -> bool:
+        cookies = parse_cookie_text(text)
+        if not cookies:
+            return False
+        self.manual_raw = normalize_cookie_text(text)
+        self.manual_cookies = cookies
+        self.manual_xsrf = cookies.get('XSRF-TOKEN', '')
+        self.manual_invalid = False
+        self.manual_expire_at = ''
+        self.save(force=True)
+        return True
+
+    def clear_manual(self) -> None:
+        self.manual_raw = ''
+        self.manual_cookies = {}
+        self.manual_xsrf = ''
+        self.manual_invalid = False
+        self.manual_expire_at = ''
+        self.save(force=True)
+
+    def absorb(self, raw_headers) -> None:
+        """把响应里的 Set-Cookie 滚动合并进来（续期 / 保持身份新鲜）"""
+        cookies, expires = split_set_cookie(raw_headers)
+        if not cookies:
+            return
+        if self.has_manual:
+            self.manual_cookies.update(cookies)
+            if 'SUB' in expires:
+                self.manual_expire_at = expires['SUB']
+        else:
+            self.guest.update(cookies)
+            if cookies.get('XSRF-TOKEN'):
+                self.guest_xsrf = cookies['XSRF-TOKEN']
+            if 'SUB' in expires:
+                self.guest_expire_at = expires['SUB']
+        self.save()
+
+    async def refresh_guest(self) -> bool:
+        result = await request_guest_cookie()
+        if not result:
+            return False
+        cookies, expires = result
+        self.guest = cookies
+        self.guest_xsrf = cookies.get('XSRF-TOKEN', '')
+        self.guest_fetched_at = _now_str()
+        self.guest_expire_at = expires.get('SUB') or expires.get('SUBP') or ''
+        self.save(force=True)
+        sv.logger.info(f"已更新自动游客 Cookie（过期时间: {self.guest_expire_at or '未知'}）")
+        return True
+
+    async def ensure_ready(self) -> bool:
+        """确保手上有一套可用 Cookie；游客身份临近过期时提前续期"""
+        if self.cookie_header():
+            if not self.has_manual and self.guest:
+                left = self.guest_days_left()
+                if left is not None and left < 3:
+                    sv.logger.info("游客 Cookie 临近过期，提前自动续期")
+                    await self.refresh_guest()
+            return True
+        return await self.refresh_guest()
+
+    async def handle_auth_failure(self) -> bool:
+        """认证失败处理：手工 Cookie 降级到游客身份，并刷新游客身份
+
+        返回 True 表示已经换过 Cookie，调用方可以重试一次。
+        """
+        changed = False
+        if self.has_manual:
+            self.manual_invalid = True
+            changed = True
+            self.save(force=True)
+            sv.logger.warning("手工 Cookie 已失效，自动降级为游客身份")
+        if await self.refresh_guest():
+            changed = True
+        return changed
+
+
+COOKIES = CookieStore(_load_json_file(DATA_FILE, {}))
+
+
+async def weibo_api_get(url, referer='', retry=2, stop_on_login=False, allow_fallback=True):
+    """统一的 m.weibo.cn 请求入口
+
+    返回 (body, state)，state 取值：
+      'ok'             —— 正常拿到 JSON（ok 字段由调用方判断）
+      'expired'        —— Cookie 失效，且自动续期后依旧失败
+      'login_required' —— 该接口需要真实登录（游客身份只能读第 1 页）
+      'error'          —— 其它网络/协议错误
+    """
+    session = await _get_session()
+    await COOKIES.ensure_ready()
+
+    refreshed = False   # 是否已经因为认证失败换过一套 Cookie（换 Cookie 不消耗重试次数）
+    attempt = 0
+    while attempt <= retry:
+        headers = {
+            'Referer': referer or f'{API_BASE}/',
+            'X-Requested-With': 'XMLHttpRequest',
+            'MWeibo-Pwa': '1',
+        }
+        cookie = COOKIES.cookie_header()
+        if cookie:
+            headers['Cookie'] = cookie
+        xsrf = COOKIES.xsrf()
+        if xsrf:
+            headers['X-XSRF-TOKEN'] = xsrf
+
+        consumed_attempt = True
+        try:
+            async with session.get(url, headers=headers, allow_redirects=False,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                raw_cookies = resp.headers.getall('Set-Cookie', [])
+
+                if resp.status in (301, 302, 303, 307, 308):
+                    location = resp.headers.get('Location', '') or ''
+                    if 'passport' in location or 'signin' in location or '/login' in location:
+                        if stop_on_login:
+                            return None, 'login_required'
+                        sv.logger.warning(f"微博接口要求登录（HTTP {resp.status}）")
+                        if allow_fallback and not refreshed:
+                            refreshed = True
+                            consumed_attempt = False
+                            if await COOKIES.handle_auth_failure():
+                                continue
+                        return None, 'expired'
+                    sv.logger.warning(f"微博接口异常跳转({resp.status}): {location[:120]}")
+                    return None, 'error'
+
+                if resp.status in (401, 403, 432):
+                    sv.logger.warning(f"微博接口返回 {resp.status}（风控或 Cookie 失效）")
+                    if allow_fallback and not refreshed:
+                        refreshed = True
+                        consumed_attempt = False
+                        if await COOKIES.handle_auth_failure():
+                            continue
+                    return None, 'expired'
+
+                if resp.status != 200:
+                    sv.logger.warning(f"微博接口返回 HTTP {resp.status}")
+                else:
+                    content_type = (resp.headers.get('Content-Type') or '').lower()
+                    if 'json' not in content_type:
+                        preview = (await resp.text())[:160].replace('\n', ' ')
+                        sv.logger.warning(f"微博接口非 JSON 响应: {content_type} {preview}")
+                    else:
+                        body = await resp.json(content_type=None)
+                        COOKIES.absorb(raw_cookies)
+                        if isinstance(body, dict) and body.get('ok') == -100:
+                            # 游客身份翻第 2 页会拿到 ok=-100（等价于要求登录），
+                            # 这不是 Cookie 坏了，别误判成失效去刷新/报警。
+                            sv.logger.warning("微博接口返回 ok=-100（风控或需要登录）")
+                            if stop_on_login:
+                                return None, 'login_required'
+                            if allow_fallback and not refreshed:
+                                refreshed = True
+                                consumed_attempt = False
+                                if await COOKIES.handle_auth_failure():
+                                    continue
+                            return None, 'expired'
+                        return body, 'ok'
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            sv.logger.warning(f"微博接口请求异常(第{attempt + 1}次): {type(e).__name__}: {e}")
+
+        if consumed_attempt:
+            attempt += 1
+        if attempt <= retry:
+            await asyncio.sleep(2 + attempt * 2)
+
+    return None, 'error'
+
+
+# 初始化配置
+load_config()
   
-def parse_html_response(html_content):  
-    """解析HTML响应，提取微博内容"""  
-    try:  
-        from lxml import etree  
-        import re  
-              
-        # 移除XML声明  
-        if html_content.startswith('<?xml'):  
-            html_content = re.sub(r'<\?xml[^>]*\?>', '', html_content)  
-              
-        # 解析HTML  
-        selector = etree.HTML(html_content)  
-        if selector is None:  
-            sv.logger.error("HTML解析失败：selector为None")  
-            return []  
-              
-        # 查找所有微博卡片  
-        cards = selector.xpath('//div[@class="c" and starts-with(@id, "M_")]')  
-        all_posts = []  
-              
-        for card in cards:  
-            try:  
-                # 提取微博ID  
-                card_id = card.get('id', '')  
-                post_id = card_id.replace('M_', '') if card_id else 'unknown'  
-                      
-                # 提取文本内容  
-                text_parts = []  
-                text_nodes = card.xpath('.//span[@class="ctt"]/text()')  
-                for node in text_nodes:  
-                    if node and node.strip():  
-                        text_parts.append(node.strip())  
-                      
-                if not text_parts:  
-                    all_text = card.xpath('.//text()')  
-                    for text in all_text:  
-                        text = text.strip()  
-                        if text and not any(x in text for x in ['转发', '评论', '赞', '来自', '原文链接']):  
-                            text_parts.append(text)  
-                      
-                text = '\n'.join(text_parts) if text_parts else "【无正文内容】" 
-                      
-                # 针对多图微博的专门提取逻辑  
-                pic_urls = []  
-                found_imgs = set()  
-                    
-                sv.logger.info(f"微博 {post_id} 开始多图专项分析")  
-                    
-                # 策略1：查找所有包含图片的链接（多图通常在多个a标签中）  
-                img_links = card.xpath('.//a[.//img]')  
-                sv.logger.info(f"微博 {post_id} 找到 {len(img_links)} 个包含图片的链接")  
-                    
-                for i, link in enumerate(img_links):  
-                    # 获取链接中的所有图片  
-                    link_imgs = link.xpath('.//img')  
-                    for img in link_imgs:  
-                        src = img.get('src', '')  
-                        # 放宽图片过滤条件  
-                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
-                            # 简化域名检查  
-                            if 'sinaimg' in src.lower():  
-                                # 仅过滤明显的非内容图片  
-                                if not any(x in src.lower() for x in ['h5.sinaimg.cn', '/upload/', 'avatar', 'profile']):  
-                                    found_imgs.add(src)
-                                    sv.logger.info(f"链接{i}中发现图片: {src}")  
-                    
-                # 策略2：查找可能的图片组容器  
-                possible_containers = [    
-                    './/div[contains(@class, "media")]//img',  
-                    './/div[contains(@class, "gallery")]//img',     
-                    './/div[contains(@class, "photos")]//img',  
-                    './/div[contains(@class, "img")]//img',  
-                    './/span[contains(@class, "ib")]//img',  # 基于日志中的class='ib'  
-                ]  
-                    
-                for container_query in possible_containers:  
-                    container_imgs = card.xpath(container_query)  
-                    sv.logger.info(f"容器查询 '{container_query}' 找到 {len(container_imgs)} 个图片")  
-                        
-                    for img in container_imgs:  
-                        src = img.get('src', '')  
-                        if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
-                            if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
-                                src_lower = src.lower()  
-                                if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
-                                    found_imgs.add(src)  
-                    
-                # 策略3：查找所有img标签（备用）  
-                all_imgs = card.xpath('.//img')  
-                sv.logger.info(f"备用查询找到 {len(all_imgs)} 个img标签")  
-                    
-                for img in all_imgs:  
-                    src = img.get('src', '')  
-                    if src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):  
-                        if any(domain in src for domain in ['sinaimg.cn', 'wx1.sinaimg.cn', 'wx2.sinaimg.cn', 'wx3.sinaimg.cn', 'wx4.sinaimg.cn']):  
-                            src_lower = src.lower()  
-                            if 'h5.sinaimg.cn' not in src_lower and '/upload/' not in src_lower:  
-                                found_imgs.add(src)  
-                    
-                # 转换为原图URL  
-                for src in found_imgs:  
-                    original_url = src.replace('/wap180/', '/large/').replace('/thumb/', '/large/').replace('/bmiddle/', '/large/')  
-                    if original_url.startswith('//'):  
-                        original_url = 'https:' + original_url  
-                    if original_url not in pic_urls:  
-                        pic_urls.append(original_url)  
-                    
-                sv.logger.info(f"微博 {post_id} 最终提取到 {len(pic_urls)} 张图片")  
-                      
-                # 提取时间  
-                time_elem = card.xpath('.//span[@class="ct"]')  
-                time_text = time_elem[0].text if time_elem else 'unknown'  
-                  
-                # 标准化时间格式  
-                formatted_time = format_weibo_time(time_text)  
-                      
-                all_posts.append({  
-                    'id': post_id,  
-                    'text': text,  
-                    'pics': pic_urls,  
-                    'video': {'play_page_url': '', 'cover_url': ''},  
-                    'created_at': time_text,  
-                    'created_time': formatted_time,  # 新增标准化时间字段  
-                    'reposts_count': 0,  
-                    'comments_count': 0,  
-                    'attitudes_count': 0  
-                })  
-                      
-            except Exception as e:  
-                sv.logger.error(f"解析单个微博卡片失败: {e}")  
-                continue  
-              
-        return all_posts  
-              
-    except Exception as e:  
-        sv.logger.error(f"HTML解析失败: {e}")  
-        return []
+# 说明：原 HTML 降级解析函数 parse_html_response 已删除。
+# 原因：m.weibo.cn/u/<uid> 现在返回的是 Vue 骨架页（$render_data 为空，也没有
+# div.c / id="M_" 的卡片），XPath 永远解析不到内容 —— 属于「必然失败、还白打
+# 两次请求」的死代码。真正能拿到数据的只有 getIndex 接口。
         
-async def get_weibo_user_info(uid, retry=2, force_refresh=False):  
-    """获取微博用户信息（带重试+格式校验+强制刷新）"""  
-    if not uid.isdigit():  
-        return None  
-      
-    # 强制刷新时清除缓存  
-    if force_refresh and uid in weibo_config['account_cache']:  
-        del weibo_config['account_cache'][uid]  
-        save_config()  
-      
-    # 优先从缓存获取  
-    if uid in weibo_config['account_cache']:  
-        cached_info = weibo_config['account_cache'][uid]  
-        # 验证缓存的UID是否匹配  
-        if cached_info.get('uid') == uid:  
-            # 确保缓存中有有效的用户名  
-            if not cached_info.get('name'):  
-                cached_info['name'] = f'用户{uid}'  
-                weibo_config['account_cache'][uid] = cached_info  
-                save_config()  
-            return cached_info  
-        else:  
-            # 缓存不匹配，清除并重新获取  
-            sv.logger.warning(f"缓存UID不匹配，清除缓存: 缓存={cached_info.get('uid')}, 请求={uid}")  
-            del weibo_config['account_cache'][uid]  
-            save_config()  
-      
-    url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}'  
-    for attempt in range(retry + 1):  
-        try:  
-            async with aiohttp.ClientSession(headers=headers) as session:  
-                async with session.get(url, timeout=10) as resp:  
-                    # 校验响应是否为JSON  
-                    if 'application/json' not in resp.headers.get('Content-Type', ''):  
-                        sv.logger.warning(f"用户{uid}信息非JSON响应(尝试{attempt+1}/{retry+1})，重试中")  
-                        await asyncio.sleep(3)  
-                        continue  
-                      
-                    data = await resp.json()  
-                    if data.get('ok') == 1:  
-                        user_info = data.get('data', {}).get('userInfo', {})  
-                        if not user_info:  
-                            sv.logger.warning(f"用户{uid}信息为空，API返回: {data}")  
-                            # 返回默认用户信息而不是None  
-                            result = {  
-                                'name': f'用户{uid}',  
-                                'uid': uid  
-                            }  
-                            weibo_config['account_cache'][uid] = result  
-                            save_config()  
-                            return result  
-                          
-                        # 缓存用户信息  
-                        result = {  
-                            'name': user_info.get('screen_name', f'用户{uid}'),  
-                            'uid': uid  
-                        }  
-                          
-                        # 确保用户名不为空  
-                        if not result['name'] or result['name'].strip() == '':  
-                            result['name'] = f'用户{uid}'  
-                            sv.logger.warning(f"用户{uid}获取到空用户名，使用默认值")  
-                          
-                        weibo_config['account_cache'][uid] = result  
-                        save_config()  
-                        sv.logger.info(f"成功获取用户{uid}信息: {result['name']}")  
-                        return result  
-                      
-                    sv.logger.warning(f"用户{uid}信息获取失败(尝试{attempt+1}/{retry+1})，API返回: {data}")  
-                    if attempt < retry:  
-                        await asyncio.sleep(3)  
-                      
-        except Exception as e:  
-            sv.logger.error(f"用户{uid}信息请求异常(尝试{attempt+1}/{retry+1}): {e}")  
-            if attempt < retry:  
-                await asyncio.sleep(3)  
-      
-    # 所有重试失败后，返回默认用户信息  
-    sv.logger.error(f"用户{uid}信息获取失败（已达最大重试次数），使用默认用户名")  
-    result = {  
-        'name': f'用户{uid}',  
-        'uid': uid  
-    }  
-    weibo_config['account_cache'][uid] = result  
-    save_config()  
-    return result
+async def get_weibo_user_info(uid, retry=2, force_refresh=False):
+    """获取微博用户信息（带缓存；失败不写缓存，避免把默认名永久缓存下来）"""
+    if not str(uid).isdigit():
+        return None
+
+    if force_refresh and uid in weibo_config['account_cache']:
+        del weibo_config['account_cache'][uid]
+        save_config()
+
+    if uid in weibo_config['account_cache']:
+        cached_info = weibo_config['account_cache'][uid]
+        if cached_info.get('uid') == uid:
+            if not cached_info.get('name'):
+                cached_info['name'] = f'用户{uid}'
+                weibo_config['account_cache'][uid] = cached_info
+                save_config()
+            return cached_info
+        sv.logger.warning(f"缓存UID不匹配，清除缓存: 缓存={cached_info.get('uid')}, 请求={uid}")
+        del weibo_config['account_cache'][uid]
+        save_config()
+
+    url = f'{API_BASE}/api/container/getIndex?type=uid&value={uid}'
+    body, state = await weibo_api_get(url, referer=f'{API_BASE}/u/{uid}', retry=retry)
+
+    if state == 'ok' and isinstance(body, dict) and body.get('ok') == 1:
+        user_info = (body.get('data') or {}).get('userInfo') or {}
+        name = str(user_info.get('screen_name') or '').strip() or f'用户{uid}'
+        result = {'name': name, 'uid': uid}
+        weibo_config['account_cache'][uid] = result
+        save_config()
+        sv.logger.info(f"成功获取用户{uid}信息: {name}")
+        return result
+
+    if state == 'ok':
+        sv.logger.warning(f"用户{uid}信息为空，API返回: {body}")
+        # 注意：不写缓存。旧版会把「用户{uid}」缓存下来，一次网络抖动就永久显示错名
+        return {'name': f'用户{uid}', 'uid': uid}
+
+    sv.logger.error(f"用户{uid}信息获取失败(state={state})")
+    return None
+
     
 async def get_weibo_user_latest_posts(uid, count=5, retry=2):
-    """获取用户最新微博(m.weibo.cn API版本)"""
+    """获取用户最新微博（m.weibo.cn API）
+
+    游客身份只能读第 1 页（约 10 条），翻第 2 页会被要求登录 —— 这时直接停下
+    返回已取到的内容，不重试、不报警；配置了可用的手工 Cookie 才能继续翻页。
+    """
     all_posts = []
     page = 1
-    max_pages = 5
-    
-    # 新增：User-Agent池
-    user_agents = [
-        'Mozilla/5.0 (Android 13; Mobile; rv:109.0) Gecko/115.0 Firefox/115.0',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-    ]
+    max_pages = max(1, min(5, math.ceil(count / 10) + 1))
 
     while len(all_posts) < count and page <= max_pages:
-        url = f'https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page={page}'
-        
-        # 新增：随机选择User-Agent
-        current_headers = headers.copy()
-        current_headers['User-Agent'] = random.choice(user_agents)
-        
-        # 新增：随机延迟（1-3秒）避免高频请求
-        await asyncio.sleep(random.uniform(1, 3))
+        url = (f'{API_BASE}/api/container/getIndex?type=uid&value={uid}'
+               f'&containerid=107603{uid}&page={page}')
+        body, state = await weibo_api_get(
+            url, referer=f'{API_BASE}/u/{uid}', retry=retry, stop_on_login=(page > 1))
 
-        for attempt in range(retry + 1):
-            try:
-                async with aiohttp.ClientSession(headers=current_headers) as session:
-                    # 新增：超时时间延长+TCP连接复用
-                    timeout = aiohttp.ClientTimeout(total=15)
-                    async with session.get(url, timeout=timeout) as resp:
-                        if resp.status != 200:
-                            sv.logger.warning(f"微博{uid}API请求失败(页{page},尝试{attempt+1}/{retry+1}) - 状态码: {resp.status}")
-                            if resp.status in (401, 403, 432):  
-                                sv.logger.error(f"微博{uid}触发风控，状态码{resp.status}，Cookie 可能已失效")  
-                                raise CookieExpiredError(f"HTTP {resp.status}")
-                            await asyncio.sleep(3)
-                            continue
+        if state == 'login_required':
+            sv.logger.info(f"微博{uid}第{page}页需要登录，游客身份只读第 1 页，停止翻页")
+            break
+        if state == 'expired':
+            raise CookieExpiredError('接口拒绝访问，自动续期后仍失败')
+        if state != 'ok':
+            break
 
-                        content_type = resp.headers.get('Content-Type', '')
-                        if 'application/json' not in content_type:
-                            # 新增：尝试解析HTML验证码页面，提前终止
-                            html_content = await resp.text()
-                            if 'captcha' in html_content or '验证码' in html_content:  
-                                sv.logger.error(f"微博{uid}需要验证码，Cookie 可能已失效")  
-                                raise CookieExpiredError("captcha")
-                            sv.logger.warning(f"微博{uid}API非JSON响应(页{page},尝试{attempt+1}/{retry+1}) - Content-Type: {content_type}")
-                            await asyncio.sleep(3)
-                            continue
+        if not isinstance(body, dict) or body.get('ok') != 1:
+            msg = str((body or {}).get('msg') or '')
+            # ok=0 + "这里还没有内容" 是「这个账号没发过微博」，不是错误
+            if '没有内容' in msg or (isinstance(body, dict) and body.get('ok') == 0):
+                sv.logger.info(f"微博{uid}暂无微博内容（{msg or 'ok=0'}）")
+            else:
+                sv.logger.warning(f"微博{uid}API返回失败: {msg or body}")
+            break
 
-                        resp_data = await resp.json()
-                        if resp_data.get('ok') != 1:
-                            # 新增：检测风控返回码
-                            if resp_data.get('ok') == -100:  
-                                sv.logger.error(f"微博{uid}触发风控(ok=-100)，Cookie 可能已失效")  
-                                raise CookieExpiredError("ok=-100")
-                            sv.logger.warning(f"微博{uid}API返回失败(页{page},尝试{attempt+1}/{retry+1}): {resp_data}")
-                            if attempt < retry:
-                                await asyncio.sleep(3)
-                            continue
+        cards = (body.get('data') or {}).get('cards') or []
+        for card in cards:
+            if card.get('card_type') != 9:
+                continue
+            mblog = card.get('mblog') or {}
+            if not mblog:
+                continue
 
-                        # 原有解析逻辑...
-                        cards = resp_data.get('data', {}).get('cards', [])
-                        for card in cards:
-                            if card.get('card_type') != 9:
-                                continue
-                            mblog = card.get('mblog', {})
-                            if not mblog:
-                                continue
+            raw_text = mblog.get('text', '') or ''
+            text = re.sub(r'<br\s*/?>', '\n', raw_text)
+            text = re.sub(r'<[^>]+>', '', text)
+            text = html.unescape(text).strip() or '【无正文内容】'
 
-                            # 提取文本（HTML转纯文本）
-                            raw_text = mblog.get('text', '')
-                            text = re.sub(r'<br\s*/?>', '\n', raw_text)
-                            text = re.sub(r'<[^>]+>', '', text)
-                            text = html.unescape(text).strip()
-                            if not text:
-                                text = '【无正文内容】'
+            pic_urls = []
+            for pic in mblog.get('pics') or []:
+                large_url = (pic.get('large') or {}).get('url', '')
+                if large_url:
+                    pic_urls.append(large_url)
+                elif pic.get('url'):
+                    pic_urls.append(pic['url'])
 
-                            # 提取图片
-                            pic_urls = []
-                            pics = mblog.get('pics', [])
-                            for pic in pics:
-                                large_url = pic.get('large', {}).get('url', '')
-                                if large_url:
-                                    pic_urls.append(large_url)
-                                else:
-                                    url_fallback = pic.get('url', '')
-                                    if url_fallback:
-                                        pic_urls.append(url_fallback)
+            video_info = {'play_page_url': '', 'cover_url': ''}
+            page_info = mblog.get('page_info') or {}
+            if page_info and page_info.get('type') == 'video':
+                media_info = page_info.get('media_info') or {}
+                video_info['play_page_url'] = (media_info.get('stream_url_hd', '')
+                                               or media_info.get('stream_url', ''))
+                page_pic = page_info.get('page_pic')
+                video_info['cover_url'] = (page_pic or {}).get('url', '') if isinstance(page_pic, dict) else str(page_pic or '')
 
-                            # 提取视频信息
-                            video_info = {'play_page_url': '', 'cover_url': ''}
-                            page_info = mblog.get('page_info', {})
-                            if page_info and page_info.get('type') == 'video':
-                                media_info = page_info.get('media_info', {})
-                                video_info['play_page_url'] = media_info.get('stream_url_hd', '') or media_info.get('stream_url', '')
-                                page_pic = page_info.get('page_pic', {})
-                                video_info['cover_url'] = page_pic.get('url', '') if isinstance(page_pic, dict) else str(page_pic)
+            created_at = mblog.get('created_at', 'unknown')
+            all_posts.append({
+                'id': str(mblog.get('id', 'unknown')),
+                'text': text,
+                'pics': pic_urls,
+                'video': video_info,
+                'created_at': created_at,
+                'created_time': format_weibo_time(created_at),
+                'reposts_count': mblog.get('reposts_count', 0),
+                'comments_count': mblog.get('comments_count', 0),
+                'attitudes_count': mblog.get('attitudes_count', 0),
+            })
 
-                            # 时间处理
-                            created_at = mblog.get('created_at', 'unknown')
-                            formatted_time = format_weibo_time(created_at)
-
-                            all_posts.append({
-                                'id': str(mblog.get('id', 'unknown')),
-                                'text': text,
-                                'pics': pic_urls,
-                                'video': video_info,
-                                'created_at': created_at,
-                                'created_time': formatted_time,
-                                'reposts_count': mblog.get('reposts_count', 0),
-                                'comments_count': mblog.get('comments_count', 0),
-                                'attitudes_count': mblog.get('attitudes_count', 0)
-                            })
-
-                            if len(all_posts) >= count:
-                                return all_posts[:count]
-
-                        break
-
-            except CookieExpiredError:  
-                raise  # 直接向上抛，不重试  
-            except Exception as e:  
-                sv.logger.error(f"微博{uid}API请求异常(页{page},尝试{attempt+1}/{retry+1}): {type(e).__name__}: {e}")  
-                if attempt < retry:  
-                    await asyncio.sleep(3)
+            if len(all_posts) >= count:
+                return all_posts[:count]
 
         page += 1
-        await asyncio.sleep(random.uniform(2, 4))  # 新增：页面间随机延迟
+        if len(all_posts) < count and page <= max_pages:
+            await asyncio.sleep(random.uniform(1.5, 3))
 
-    return all_posts
+    return all_posts[:count]
 
 
-async def check_and_push_new_weibo():  
-    """检查新微博并推送"""  
-    global _cookie_expired_notified  
+
+_check_lock = None
+
+
+def _get_check_lock():
+    global _check_lock
+    if _check_lock is None:
+        _check_lock = asyncio.Lock()
+    return _check_lock
+
+
+async def notify_superusers(text: str) -> None:
+    """私聊所有主人；失败只记日志，不抛异常"""
+    try:
+        bot = hoshino.get_bot()
+        for superuser_id in hoshino.config.SUPERUSERS:
+            try:
+                await bot.send_private_msg(user_id=int(superuser_id), message=text)
+            except Exception as e:
+                sv.logger.error(f"通知主人 {superuser_id} 失败: {e}")
+    except Exception as e:
+        sv.logger.error(f"通知主人失败: {e}")
+
+
+async def check_and_push_new_weibo():
+    """检查新微博并推送（加互斥锁，避免定时任务和手动检查重复推送）"""
+    lock = _get_check_lock()
+    if lock.locked():
+        sv.logger.info("上一次微博检查还没结束，跳过本次触发")
+        return False
+    async with lock:
+        await _check_and_push_new_weibo()
+    return True
+
+
+async def _check_and_push_new_weibo():
+    global _cookie_expired_notified
     sv.logger.info("开始检查微博更新...")
+
     all_followed_uids = set()
     for follows in weibo_config['group_follows'].values():
         all_followed_uids.update(follows.keys())
-      
-    for uid in all_followed_uids:
+    if not all_followed_uids:
+        sv.logger.info("没有需要检查的微博账号")
+        return
+
+    had_error = False
+    for uid in sorted(all_followed_uids):
         try:
-            # 优先使用API获取
-            latest_posts = await get_weibo_user_latest_posts(uid)
-            
-            # 新增：API失败时使用HTML解析降级
-            if not latest_posts:
-                sv.logger.info(f"微博{uid}API获取失败，尝试HTML解析降级")
-                html_url = f'https://m.weibo.cn/u/{uid}'
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(html_url, timeout=10) as resp:
-                        if resp.status == 200:
-                            html_content = await resp.text()
-                            latest_posts = parse_html_response(html_content)
-            
+            # 取满一页（10 条），避免截断导致「新微博被静默丢掉」
+            latest_posts = await get_weibo_user_latest_posts(uid, count=10)
             if not latest_posts:
                 continue
-          
-            # 原有逻辑...
+
+            # 各群水位线取最早的一个，保证落后的群也能补上
             min_last_post_time = ''
-            for group_id, follows in weibo_config['group_follows'].items():
+            for follows in weibo_config['group_follows'].values():
                 if uid in follows:
                     current_time = follows[uid].get('last_post_time', '')
                     if not min_last_post_time or current_time < min_last_post_time:
                         min_last_post_time = current_time
-            
-            new_posts = [post for post in latest_posts if post['created_time'] > min_last_post_time]
+
+            new_posts = [p for p in latest_posts
+                         if p.get('created_time') and p['created_time'] > min_last_post_time]
             if not new_posts:
                 continue
-          
+
             new_posts.sort(key=lambda x: x['created_time'])
+            pushed_time = ''
             all_groups_to_update = set()
-          
+
             for post in new_posts:
                 groups_to_push = []
                 for group_id, follows in weibo_config['group_follows'].items():
-                    if (uid in follows and 
-                        weibo_config['group_enable'].get(group_id, True) and 
-                        post['created_time'] > follows[uid].get('last_post_time', '')):
+                    if (uid in follows
+                            and weibo_config['group_enable'].get(group_id, True)
+                            and post['created_time'] > follows[uid].get('last_post_time', '')):
                         groups_to_push.append(group_id)
                         all_groups_to_update.add(group_id)
-              
+
                 if groups_to_push:
                     user_info = await get_weibo_user_info(uid)
                     user_name = user_info['name'] if user_info else f'用户{uid}'
@@ -610,93 +914,91 @@ async def check_and_push_new_weibo():
                         user_info = await get_weibo_user_info(uid, force_refresh=True)
                         user_name = user_info['name'] if user_info else f'用户{uid}'
                     await push_weibo_to_groups(groups_to_push, user_name, uid, post)
-              
-            if all_groups_to_update:
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    pushed_time = max(pushed_time, post['created_time'])
+
+            if all_groups_to_update and pushed_time:
+                # 水位线用「真正推送过的最新微博时间」，而不是 now()：
+                # 用 now() 会把「抓取期间刚发布的微博」永久跳过
                 for group_id in all_groups_to_update:
-                    weibo_config['group_follows'][group_id][uid]['last_post_time'] = current_time
+                    weibo_config['group_follows'][group_id][uid]['last_post_time'] = pushed_time
                 save_config()
-          
-        except CookieExpiredError as e:  
-            if not _cookie_expired_notified:  
-                _cookie_expired_notified = True  
-                msg = f"[微博推送] 微博 Cookie 已失效（{e}），推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。"  
-                try:  
-                    bot = hoshino.get_bot()  
-                    for superuser_id in hoshino.config.SUPERUSERS:  
-                        await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
-                except Exception as notify_err:  
-                    sv.logger.error(f"通知主人失败: {notify_err}")  
-            break  
-        except Exception as e:  
-            sv.logger.error(f"处理微博{uid}时出错: {e}")  
+
+        except CookieExpiredError as e:
+            sv.logger.error(f"微博{uid}认证失败: {e}")
+            if await COOKIES.handle_auth_failure():
+                continue  # 已换成新 Cookie，后面的账号继续跑
+            had_error = True
+            if not _cookie_expired_notified:
+                _cookie_expired_notified = True
+                await notify_superusers(
+                    "[微博推送] 微博接口认证失败，自动申请游客身份也没能成功，推送已暂停。\n"
+                    "可用「微博cookie状态」查看详情，或「更新cookie [cookie字符串]」更新认证信息。"
+                )
+            break
+        except Exception as e:
+            sv.logger.error(f"处理微博{uid}时出错: {type(e).__name__}: {e}")
+            had_error = True
             continue
 
-async def merge_images_to_grid(pic_urls: list) -> str:  
-    """将多张图片合并为九宫格，返回 CQ:image base64 字符串，失败返回 None"""  
-    try:  
-        pics = pic_urls[:9]  
-        n = len(pics)  
-        if n <= 2:  
-            return None  
-  
-        # 使用专门的图片下载headers（不使用全局API headers）  
-        img_headers = {  
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',  
-            'Referer': 'https://m.weibo.cn/',  
-            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',  
-        }  
-  
-        images = []  
-        async with aiohttp.ClientSession() as session:  
-            for url in pics:  
-                try:  
-                    async with session.get(url, headers=img_headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as resp:  
-                        sv.logger.info(f"下载图片 {url} 状态码: {resp.status}")  
-                        if resp.status == 200:  
-                            img_data = await resp.read()  
-                            sv.logger.info(f"图片数据大小: {len(img_data)} bytes")  
-                            img = Image.open(BytesIO(img_data))  
-                            img = img.convert('RGB')  # 确保统一为RGB模式  
-                            images.append(img)  
-                        else:  
-                            sv.logger.warning(f"下载图片失败 HTTP {resp.status}: {url}")  
-                except Exception as e:  
-                    sv.logger.warning(f"下载图片异常: {url}, {type(e).__name__}: {e}")  
-  
-        sv.logger.info(f"成功下载 {len(images)}/{len(pics)} 张图片")  
-  
-        if len(images) <= 2:  
-            sv.logger.warning(f"下载成功的图片不足3张({len(images)}张)，放弃合并")  
-            return None  
-  
-        n = len(images)  
-        cols = 3 if n > 2 else n  
-        rows = math.ceil(n / cols)  
-        cell_size = 300  
-        gap = 4  
-        canvas_w = cols * cell_size + (cols - 1) * gap  
-        canvas_h = rows * cell_size + (rows - 1) * gap  
-        canvas = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))  
-  
-        for i, img in enumerate(images):  
-            row_idx = i // cols  
-            col_idx = i % cols  
-            fitted = ImageOps.fit(img, (cell_size, cell_size))  
-            x = col_idx * (cell_size + gap)  
-            y = row_idx * (cell_size + gap)  
-            canvas.paste(fitted, (x, y))  
-  
-        buf = BytesIO()  
-        canvas.save(buf, format='JPEG', quality=85)  
-        b64 = base64.b64encode(buf.getvalue()).decode()  
-        sv.logger.info(f"九宫格合并成功，base64长度: {len(b64)}")  
-        return f"[CQ:image,file=base64://{b64}]"  
-    except Exception as e:  
-        sv.logger.error(f"合并九宫格图片失败: {type(e).__name__}: {e}")  
-        import traceback  
-        sv.logger.error(traceback.format_exc())  
+    if not had_error:
+        _cookie_expired_notified = False
+    sv.logger.info("微博更新检查完成")
+
+
+async def merge_images_to_grid(pic_urls: list) -> str:
+    """将多张图片合并为九宫格，返回 CQ:image base64 字符串，失败返回 None"""
+    try:
+        pics = [u for u in (pic_urls or []) if u][:9]
+        if len(pics) <= 2:
+            return None
+
+        img_headers = {
+            'User-Agent': _MOBILE_UA,
+            'Referer': 'https://m.weibo.cn/',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        }
+
+        session = await _get_session()
+        images = []
+        for url in pics:
+            try:
+                # 注意：不再用 ssl=False，图片站证书正常，关掉校验有害无益
+                async with session.get(url, headers=img_headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        sv.logger.warning(f"下载图片失败 HTTP {resp.status}: {url}")
+                        continue
+                    img_data = await resp.read()
+                images.append(Image.open(BytesIO(img_data)).convert('RGB'))
+            except Exception as e:
+                sv.logger.warning(f"下载图片异常: {url}, {type(e).__name__}: {e}")
+
+        if len(images) <= 2:
+            sv.logger.warning(f"下载成功的图片不足3张({len(images)}张)，放弃合并")
+            return None
+
+        n = len(images)
+        cols = 3 if n > 2 else n
+        rows = math.ceil(n / cols)
+        cell_size = 300
+        gap = 4
+        canvas_w = cols * cell_size + (cols - 1) * gap
+        canvas_h = rows * cell_size + (rows - 1) * gap
+        canvas = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
+
+        for i, img in enumerate(images):
+            fitted = ImageOps.fit(img, (cell_size, cell_size), method=Image.LANCZOS)
+            canvas.paste(fitted, ((i % cols) * (cell_size + gap), (i // cols) * (cell_size + gap)))
+
+        buf = BytesIO()
+        canvas.save(buf, format='JPEG', quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        sv.logger.info(f"九宫格合并成功（{n} 图，base64 长度 {len(b64)}）")
+        return f"[CQ:image,file=base64://{b64}]"
+    except Exception as e:
+        sv.logger.error(f"合并九宫格图片失败: {type(e).__name__}: {e}")
         return None
+
         
 async def push_weibo_to_groups(group_ids, name, uid, post):  
     """推送微博到指定群（优先使用配置文件中的自定义名称）"""  
@@ -1038,7 +1340,9 @@ async def weibo_help(bot, ev: CQEvent):
 - 微博黑名单移除 [ID]:将指定微博ID从本群黑名单移除(管理员)  
 - 查看微博黑名单:查看本群黑名单中的微博ID(管理员)  
 - 官方半月刊：查看PCR半月刊
-- 更新cookie + cookie  
+- 微博cookie状态:查看 Cookie 状态与实时校验(管理员)
+- 更新cookie [cookie]:更新手工 Cookie(超管，可选)
+- 清除cookie:丢弃手工 Cookie，改回自动游客身份(超管)
 - 检查微博更新
 注:微博ID是指微博的数字ID,不是昵称哦~'''  
     await bot.send(ev, help_msg)
@@ -1083,13 +1387,12 @@ async def view_weibo(bot, ev: CQEvent):
     # 获取最新5条微博  
     try:  
         posts = await get_weibo_user_latest_posts(uid, count=5)  
-    except CookieExpiredError:  
-        msg = '[微博推送] 微博 Cookie 已失效，推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。'  
-        try:  
-            for superuser_id in hoshino.config.SUPERUSERS:  
-                await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
-        except Exception as notify_err:  
-            sv.logger.error(f"通知主人失败: {notify_err}")  
+    except CookieExpiredError as e:
+        await notify_superusers(
+            f"[微博推送] 微博接口认证失败（{e}），自动申请游客身份也没能成功。\n"
+            "可用「微博cookie状态」查看详情，或「更新cookie [cookie字符串]」更新认证信息。"
+        )
+        await bot.finish(ev, '微博接口认证异常，已通知主人，请稍后再试~')
         return
     if not posts:  
         await bot.finish(ev, f'{user_info["name"]} 暂无微博内容~')  
@@ -1145,14 +1448,13 @@ async def get_official_biweekly(bot, ev: CQEvent):
         # 获取最新70条微博(增加数量以提高找到半月刊的概率)  
         try:  
             posts = await get_weibo_user_latest_posts(uid, count=70)  
-        except CookieExpiredError:  
-            msg = '[微博推送] 微博 Cookie 已失效，推送功能已暂停。\n请使用「更新cookie [cookie字符串]」命令更新认证信息。'  
-            try:  
-                for superuser_id in hoshino.config.SUPERUSERS:  
-                    await bot.send_private_msg(user_id=int(superuser_id), message=msg)  
-            except Exception as notify_err:  
-                sv.logger.error(f"通知主人失败: {notify_err}")  
-            return  
+        except CookieExpiredError as e:
+            await notify_superusers(
+                f"[微博推送] 微博接口认证失败（{e}），自动申请游客身份也没能成功。\n"
+                "可用「微博cookie状态」查看详情，或「更新cookie [cookie字符串]」更新认证信息。"
+            )
+            await bot.finish(ev, '❌ 微博接口认证异常，已通知主人，请稍后再试')
+            return
           
         # 查找包含"活动半月刊"的微博  
         biweekly_post = None  
@@ -1202,42 +1504,130 @@ async def get_official_biweekly(bot, ev: CQEvent):
         await bot.finish(ev, f'❌ 获取半月刊时发生错误: {str(e)}\n'  
                           '💡 请稍后重试或联系管理员处理')
 
-# 在weibo.py中新增更新Cookie的命令处理函数
+# -------------------------- Cookie 管理命令 --------------------------
+_PROBE_UID_FALLBACK = '6603867494'  # 公主连结官方号，仅用于健康检查
+
+
+def _pick_probe_uid(group_id=None):
+    if group_id:
+        follows = weibo_config['group_follows'].get(str(group_id)) or {}
+        if follows:
+            return next(iter(follows))
+    for follows in weibo_config['group_follows'].values():
+        if follows:
+            return next(iter(follows))
+    return _PROBE_UID_FALLBACK
+
+
+async def _validate_cookie(probe_uid=None):
+    """真正打一次时间线接口来验证 Cookie；返回 (是否可用, 说明文本)"""
+    probe_uid = probe_uid or _pick_probe_uid()
+    body, state = await weibo_api_get(
+        f'{API_BASE}/api/container/getIndex?type=uid&value={probe_uid}&containerid=107603{probe_uid}',
+        referer=f'{API_BASE}/u/{probe_uid}', retry=0, allow_fallback=False)
+    if state == 'ok' and isinstance(body, dict) and body.get('ok') == 1:
+        cards = [c for c in ((body.get('data') or {}).get('cards') or [])
+                 if c.get('card_type') == 9]
+        return True, f'读取 {probe_uid} 时间线成功（{len(cards)} 条）'
+    if state == 'ok':
+        return False, f'接口返回 ok={(body or {}).get("ok")} msg={(body or {}).get("msg")}'
+    return False, f'请求失败（{state}）'
+
+
 @sv.on_prefix('更新cookie')
 async def update_weibo_cookie(bot, ev: CQEvent):
-    """更新微博Cookie（仅管理员可用）"""
+    """更新手工微博 Cookie（仅超级管理员可用，可选功能）"""
     if not priv.check_priv(ev, priv.SUPERUSER):
         await bot.finish(ev, '仅超级管理员可更新Cookie！')
-    
-    # 提取Cookie内容
+
     cookie_text = ev.message.extract_plain_text().strip()
     if not cookie_text:
         await bot.finish(ev, '请输入完整的Cookie内容，格式：更新cookie [cookie字符串]')
-    
-    # 提取XSRF-TOKEN
-    xsrf_token = ''
-    xsrf_match = re.search(r'XSRF-TOKEN=([^;]+)', cookie_text)
-    if xsrf_match:
-        xsrf_token = xsrf_match.group(1)
-    
-    # 保存到data.json
-    global data
-    data['cookie'] = cookie_text
-    data['xsrf_token'] = xsrf_token
-    
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    
-    # 更新headers
-    headers['Cookie'] = cookie_text
-    if xsrf_token:
-        headers['X-XSRF-TOKEN'] = xsrf_token
-    
-    # 重置 Cookie 失效通知标志，下次失效时可再次通知  
-    global _cookie_expired_notified  
-    _cookie_expired_notified = False  
-      
-    await bot.send(ev, f'Cookie更新成功！\nXSRF-TOKEN: {xsrf_token}\n请测试微博功能是否恢复。')
+
+    cookies = parse_cookie_text(cookie_text)
+    if not cookies:
+        await bot.finish(ev, '没能从内容里解析出 Cookie，请确认粘贴的是形如「SUB=xxx; SUBP=xxx」的内容~')
+    if 'SUB' not in cookies:
+        await bot.finish(ev, 'Cookie 里缺少 SUB 字段，请从 m.weibo.cn 重新复制完整 Cookie~')
+
+    if not COOKIES.set_manual(cookie_text):
+        await bot.finish(ev, 'Cookie 保存失败，请检查内容~')
+
+    ok, detail = await _validate_cookie(_pick_probe_uid(ev.group_id))
+    if ok:
+        await bot.send(ev, f'Cookie更新成功！{detail}。\n'
+                           '（失效时会自动降级为游客身份，可用「微博cookie状态」随时查看）')
+    else:
+        await bot.send(ev, f'Cookie 已保存，但实时校验没通过：{detail}\n'
+                           '机器人会继续用它尝试；确认失效后会自动改用游客身份，不会停摆。')
+
+
+@sv.on_fullmatch(('微博cookie状态', '微博Cookie状态', 'cookie状态'))
+async def weibo_cookie_status(bot, ev: CQEvent):
+    """查看 Cookie 状态与实时校验（管理员）"""
+    if not priv.check_priv(ev, priv.ADMIN):
+        await bot.finish(ev, '只有管理员才能查看哦~')
+
+    lines = ['📋 微博接口 Cookie 状态', f'当前使用：{COOKIES.source()}']
+
+    if COOKIES.manual_raw:
+        if COOKIES.manual_invalid:
+            lines.append('手工 Cookie：已失效（已自动降级为游客身份）')
+        else:
+            lines.append('手工 Cookie：使用中')
+        if COOKIES.manual_expire_at:
+            left = COOKIES.manual_days_left()
+            extra = f'，剩余 {left:.1f} 天' if left is not None else ''
+            lines.append(f'　过期时间：{COOKIES.manual_expire_at}{extra}')
+        else:
+            lines.append('　过期时间：未知（微博登录 Cookie 一般 7 天左右）')
+    else:
+        lines.append('手工 Cookie：未设置（不需要也没问题）')
+
+    if COOKIES.guest:
+        left = COOKIES.guest_days_left()
+        left_txt = f'剩余 {left:.1f} 天' if left is not None else '过期时间未知'
+        lines.append(f'自动游客 Cookie：已获取（{left_txt}）')
+        lines.append(f'　获取时间：{COOKIES.guest_fetched_at or "未知"}')
+    else:
+        lines.append('自动游客 Cookie：尚未获取（首次调用时自动申请）')
+
+    ok, detail = await _validate_cookie(_pick_probe_uid(ev.group_id))
+    lines.append(f'实时校验：{"✅ " + detail if ok else "❌ " + detail}')
+    lines.append('说明：游客身份可读第 1 页（约 10 条），手工 Cookie 可翻更多页。')
+    await bot.send(ev, '\n'.join(lines))
+
+
+@sv.on_fullmatch(('清除cookie', '清除微博cookie', '删除微博cookie'))
+async def clear_weibo_cookie(bot, ev: CQEvent):
+    """清除手工 Cookie，改用自动游客身份（仅超级管理员）"""
+    if not priv.check_priv(ev, priv.SUPERUSER):
+        await bot.finish(ev, '仅超级管理员可执行该操作！')
+    COOKIES.clear_manual()
+    await COOKIES.refresh_guest()
+    ok, detail = await _validate_cookie(_pick_probe_uid(ev.group_id))
+    await bot.send(ev, f'已清除手工 Cookie，改用自动游客身份。\n'
+                       f'校验：{"✅ " + detail if ok else "❌ " + detail}')
+
+
+@sv.scheduled_job('cron', hour=10, minute=25)
+async def scheduled_cookie_health():
+    """每天巡检一次 Cookie：临近过期自动续期，彻底不可用时私聊主人"""
+    try:
+        await COOKIES.ensure_ready()
+        ok, detail = await _validate_cookie()
+        if ok:
+            sv.logger.info(f"Cookie 巡检正常：{COOKIES.source()}（{detail}）")
+            return
+        sv.logger.error(f"Cookie 巡检失败：{detail}")
+        await notify_superusers(
+            f"[微博推送] Cookie 巡检失败：{detail}\n"
+            f"当前使用：{COOKIES.source()}\n"
+            "可用「微博cookie状态」查看详情，或「更新cookie [cookie字符串]」更新认证信息。"
+        )
+    except Exception as e:
+        sv.logger.error(f"Cookie 巡检异常: {type(e).__name__}: {e}")
+
        
 # 主动检查微博更新  
 @sv.on_fullmatch(('检查微博更新', '检查微博', '微博检查'))  
@@ -1256,8 +1646,11 @@ async def manual_check_weibo(bot, ev: CQEvent):
       
     try:  
         # 调用核心检查函数  
-        await check_and_push_new_weibo()  
-        await bot.send(ev, '✅ 微博检查完成！如有新动态已推送至相关群组')  
+        ran = await check_and_push_new_weibo()
+        if ran is False:
+            await bot.send(ev, '⏳ 已有一轮微博检查正在进行中，本次跳过，请稍后再试~')
+        else:
+            await bot.send(ev, '✅ 微博检查完成！如有新动态已推送至相关群组')  
     except Exception as e:  
         sv.logger.error(f"手动检查微博失败: {e}")  
         await bot.send(ev, f'❌ 检查过程中出现错误: {str(e)}')  
